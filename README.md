@@ -190,11 +190,13 @@ All rights reserved. The source is public to read and evaluate, not to reuse. Se
 
 ## Roadmap
 
-1. ~~Logger, sinks, async, demo, tests~~
-2. ~~Lock-free queue for the async sink, measured against the mutex one~~
-3. ~~Colour palette, per-logger name colours~~
-4. ~~Build and test on Linux (WSL, GCC 14)~~
-5. Deferred formatting: queue the arguments instead of the formatted text, so the caller pays only a copy. Needs an explicit snapshot rule for argument types that hold pointers or references, with eager formatting as the fallback.
-7. Shrink the record: fields, bytes, stack and duration behind one optional extras object, so the 200-byte record (and the 830 KiB default ring) drop by nearly half
-8. A JSON header line per file (schema, pid, base timestamp, a thread-id table) so every line can carry a short thread number and a delta time instead of repeating the full values
-6. ~~Structured output (JSON lines) as a sink option, with typed fields~~
+Done so far: the logger and sinks, the lock-free async queue, colour with per-logger names, Linux (GCC 14 under WSL), JSON Lines with typed fields, three review rounds. What is left, in the order it is worth doing:
+
+1. **Continuous integration.** A GitHub Actions matrix (MSVC, GCC 14, Clang with libc++) that configures, builds, runs CTest and the mutation script on every push. Cheap, and it turns "tested on two machines" into a claim anyone can check.
+2. **Clang and libc++.** Never built. libc++ 20 should work as is; 18 and 19 need `-fexperimental-library` for `std::jthread`, and the time zone fallback path has never run for real.
+3. **Benchmark percentiles.** p50, p99 and worst case per call, plus allocation counts, next to the averages. The tail is what a game loop feels; the average hides it.
+4. **A run summary for agents.** One JSON object at flush and at exit: records per level and per logger, dropped records, write failures, rotations, and the first and last error with their line numbers. A model reads that first and opens the full log only when it has to.
+5. **A JSON header line per file.** Schema version, pid, base timestamp and a thread-id table, so each line can carry a short thread number and a millisecond delta instead of repeating the full values. Repeated on rotation so every file stands alone.
+6. **Shrink the record.** Fields, bytes, stack and duration behind one optional extras object, so the 200-byte record (and the 830 KiB default ring) drop by nearly half and the move into the queue copies less.
+7. **Project-relative source paths.** A `strip_path_prefix` on `JsonStyle` so `src/net.cpp` can replace both the ambiguous base name and the absolute path.
+8. **Deferred formatting.** Queue the arguments instead of the formatted text, so the caller pays only a copy. Needs an explicit snapshot rule for argument types that hold pointers or references, with eager formatting as the fallback. The biggest possible speed-up, and the biggest change; last on purpose.
