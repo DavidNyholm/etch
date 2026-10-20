@@ -307,9 +307,8 @@ TEST(local_time_differs_from_utc_only_by_the_zone_offset) {
   etch::format_time(local, r.time, false);
   etch::format_time(utc, r.time, true);
   CHECK_EQ(utc, std::string("2026-01-02 03:04:05.678"));
-  CHECK_EQ(local.size(), utc.size());
-  CHECK_EQ(local.substr(local.size() - 4),
-           std::string(".678"));  // the sub-second part is untouched
+  CHECK(local.size() == utc.size() || local == utc + "Z");  // "Z": no tz database here
+  CHECK(local.find(".678") != std::string::npos);           // the sub-second part is untouched
 }
 
 // ---- hexdump and scope --------------------------------------------------------------------
@@ -508,6 +507,32 @@ TEST(file_sink_rotation_drops_the_oldest_beyond_max_files) {
   CHECK(std::filesystem::exists(path.string() + ".2"));
   CHECK(!std::filesystem::exists(path.string() + ".3"));
 }
+
+#if defined(_WIN32)
+TEST(file_sink_keeps_appending_when_rotation_cannot_move_the_file) {
+  const auto path = scratch_dir() / "stuck.log";
+  auto file = etch::FileSink::open(path, {.max_bytes = 60, .max_files = 1, .truncate = true});
+  CHECK(file.has_value());
+  if (!file) return;
+  (*file)->set_style(etch::LineStyle{.time = false, .thread = false, .location = false});
+  etch::Logger log{"s", {*file}};
+  // Windows refuses to replace or delete a file another handle holds open without delete
+  // sharing, which makes the rename in rotate() fail. (Linux allows it, so this is Windows-only.)
+  std::ofstream blocker(path.string() + ".1");
+  blocker << "held open";
+  blocker.flush();
+  for (int i = 0; i < 30; ++i) log.warn("{:02}", i);
+  log.flush();
+  blocker.close();
+  CHECK((*file)->write_failures() > 0);
+  CHECK_EQ((*file)->rotations(), 0u);
+  const auto lines = read_lines(path);
+  CHECK_EQ(lines.size(), 30u);  // nothing lost: the live file was appended to, not truncated
+  for (int i = 0; i < 30 && i < static_cast<int>(lines.size()); ++i) {
+    CHECK_EQ(lines[i], std::format("WARN  [s] {:02}", i));
+  }
+}
+#endif
 
 TEST(console_sink_can_force_colour_off_and_on) {
   etch::ConsoleSink off(stdout, etch::ConsoleSink::ColourMode::kNever);

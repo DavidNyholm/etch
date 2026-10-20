@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <exception>
 #include <expected>
 #include <filesystem>
 #include <fstream>
@@ -143,22 +144,33 @@ class ConsoleSink final : public Sink {
     style_ = std::move(style);
   }
 
+  // Lines the stream refused (std::print throws std::system_error, fflush returns EOF).
+  std::size_t write_failures() const {
+    std::lock_guard lock(mutex_);
+    return write_failures_;
+  }
+
   void write(const Record& r) override {
     std::lock_guard lock(mutex_);
     line_.clear();
-    format_line(r, style_, line_);       // reuses one buffer: no allocation per line
-    std::println(stream_, "{}", line_);  // std::print writes UTF-8 correctly to a Windows console
-    std::fflush(stream_);
+    format_line(r, style_, line_);  // reuses one buffer: no allocation per line
+    try {
+      std::println(stream_, "{}", line_);  // std::print writes UTF-8 correctly to a Windows console
+    } catch (const std::exception&) {
+      ++write_failures_;
+    }
+    if (std::fflush(stream_) != 0) ++write_failures_;
   }
   void flush() override {
     std::lock_guard lock(mutex_);
-    std::fflush(stream_);
+    if (std::fflush(stream_) != 0) ++write_failures_;
   }
 
  private:
   std::FILE* stream_;
   LineStyle style_;   // guarded by mutex_
   std::string line_;  // guarded by mutex_
+  std::size_t write_failures_ = 0;
   mutable std::mutex mutex_;
 };
 
@@ -224,6 +236,11 @@ class FileSink final : public Sink {
     line_.clear();
     format_line(r, style_, line_);  // reuses one buffer: no allocation per line
     line_ += '\n';
+    // A failed reopen (after a rotation, say) must not disable logging for good: try again.
+    if (!out_.is_open() && reopen(/*truncate=*/false)) {
+      ++write_failures_;
+      return;
+    }
     const bool would_overflow = size_ > 0 && size_ + line_.size() > options_.max_bytes;
     if (options_.max_bytes > 0 && would_overflow) rotate();
     out_.write(line_.data(), static_cast<std::streamsize>(line_.size()));
@@ -233,7 +250,8 @@ class FileSink final : public Sink {
       ++write_failures_;
       out_.clear();  // keep the stream usable: the next write may succeed
     }
-    if (r.level >= options_.flush_on) flush_locked();
+    const bool exiting = detail::process_exiting().load(std::memory_order_relaxed);
+    if (r.level >= options_.flush_on || exiting) flush_locked();
   }
   void flush() override {
     std::lock_guard lock(mutex_);
@@ -276,7 +294,9 @@ class FileSink final : public Sink {
   // one. If the live file cannot be moved it is reopened for appending, never truncated: a
   // rotation that fails must not cost the lines it was meant to preserve.
   void rotate() {
+    flush_locked();  // what close() would flush, but with the failure counted
     out_.close();
+    if (out_.fail()) ++write_failures_;  // close can fail too; reopen() clears the state
     std::error_code ec;
     const auto numbered = [&](unsigned n) {
       auto p = path_;

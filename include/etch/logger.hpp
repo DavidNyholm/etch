@@ -234,7 +234,8 @@ class Logger {
 
   // The last step of every log call: stamp the message and deliver it. Public so that helpers
   // (ScopeTimer, custom wrappers) can log a message they formatted themselves. Applies the
-  // logger's level like every other entry point.
+  // logger's level like every other entry point. An exception thrown by a sink propagates out
+  // of the log call, and the sinks after it are skipped; AsyncSink is the one that catches.
   void emit(Level level, const std::source_location& where, std::string message) {
     if (!enabled(level)) return;
     Record r{level,
@@ -311,13 +312,22 @@ inline ScopeTimer::~ScopeTimer() {
 // default_logger().set_sinks(...) to send it elsewhere.
 //
 // It is never destroyed, on purpose: objects with static storage may log from their
-// destructors, which can run after a function-local static logger would already be gone. Its
-// sinks are flushed by an atexit handler registered on first use (the console sink flushes
-// every line anyway).
+// destructors, which can run after a function-local static logger would already be gone. An
+// atexit handler registered on first use flushes its sinks and marks the process as exiting,
+// after which file sinks flush every line, so even a destructor that runs later (one whose
+// object was constructed before the logger was first used) gets its lines out. An async sink
+// attached to it is never joined; its worker keeps writing until the process ends.
 inline Logger& default_logger() {
   static Logger* const instance = [] {
     auto* logger = new Logger{"main", {std::make_shared<ConsoleSink>()}};
-    std::atexit([] { default_logger().flush(); });
+    std::atexit([] {
+      detail::process_exiting().store(true, std::memory_order_relaxed);
+      try {
+        default_logger().flush();
+      } catch (...) {
+        // A sink that throws on flush at exit has nowhere left to report to.
+      }
+    });
     return logger;
   }();
   return *instance;

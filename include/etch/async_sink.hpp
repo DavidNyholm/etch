@@ -1,6 +1,7 @@
 // etch - AsyncSink: a lock-free bounded queue and a worker thread in front of any other sink.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <condition_variable>
@@ -45,14 +46,26 @@ namespace etch {
 // dropped() tells you how many were lost.
 //
 // flush() returns once every record enqueued before the call is written, however much is logged
-// meanwhile. Destroying the sink stops the worker after it has drained the queue, so nothing
-// logged before the destructor is lost. An exception from the inner sink is caught, counted in
-// write_failures() and costs that one record; the worker carries on.
+// meanwhile (progress is published per batch, so it returns when the batch holding the last of
+// those records is done). Destroying the sink stops the worker after it has drained the queue,
+// so nothing logged before the destructor is lost. An exception from the inner sink is caught,
+// counted in write_failures() and costs that one record; the worker carries on.
+//
+// One rule for sinks behind this one: whatever they call must not drop the last reference to
+// this AsyncSink (say, by replacing a logger's sink list with an empty one from inside a
+// callback). The destructor would then run on the worker thread and try to join itself.
 class AsyncSink final : public Sink {
  public:
   enum class Overflow { kBlock, kDrop };
   // Slots are allocated up front (about 128 bytes each), so the default stays modest.
   static constexpr std::size_t kDefaultCapacity = 4096;
+  // Upper bound for the ring: std::bit_ceil must have a representable result, and 2^30 slots
+  // is already 128 GB of slot storage.
+  static constexpr std::size_t kMaxCapacity = std::size_t{1} << 30;
+  // The worker takes at most this many records per sweep. Producers refill slots as fast as
+  // the worker frees them, so an unbounded sweep could collect forever and never write. The
+  // bound also sizes the batch storage once, so the worker never allocates while running.
+  static constexpr std::size_t kMaxBatch = 1024;
   // Before sleeping, the worker yields this many times while the queue stays empty. A burst of
   // messages then never pays a wake-up per message; an idle application still gets a sleeping
   // worker within a few microseconds.
@@ -61,7 +74,7 @@ class AsyncSink final : public Sink {
   explicit AsyncSink(std::shared_ptr<Sink> inner, std::size_t capacity = kDefaultCapacity,
                      Overflow policy = Overflow::kBlock)
       : inner_(std::move(inner)),
-        mask_(std::bit_ceil(capacity < 2 ? std::size_t{2} : capacity) - 1),
+        mask_(std::bit_ceil(std::clamp(capacity, std::size_t{2}, kMaxCapacity)) - 1),
         slots_(std::make_unique<Slot[]>(mask_ + 1)),
         policy_(policy),
         worker_([this](std::stop_token st) { run(st); }) {
@@ -103,8 +116,9 @@ class AsyncSink final : public Sink {
   }
   // Approximate while producers are active; exact once they have stopped.
   std::size_t queued() const noexcept {
-    return enqueue_pos_.load(std::memory_order_acquire) -
-           dequeue_pos_.load(std::memory_order_acquire);
+    const std::size_t tail = enqueue_pos_.load(std::memory_order_acquire);
+    const std::size_t head = dequeue_pos_.load(std::memory_order_acquire);
+    return tail >= head ? tail - head : 0;  // the two loads are not one snapshot
   }
   std::size_t capacity() const noexcept { return mask_ + 1; }  // rounded up to a power of two
   const std::shared_ptr<Sink>& inner() const noexcept { return inner_; }
@@ -127,7 +141,8 @@ class AsyncSink final : public Sink {
     for (;;) {
       Slot& slot = slots_[pos & mask_];
       const std::size_t seq = slot.sequence.load(std::memory_order_acquire);
-      const auto diff = static_cast<std::intptr_t>(seq) - static_cast<std::intptr_t>(pos);
+      // Unsigned subtraction, then a (modular, well-defined) conversion: no signed overflow.
+      const auto diff = static_cast<std::intptr_t>(seq - pos);
       if (diff == 0) {
         if (enqueue_pos_.compare_exchange_weak(pos, pos + 1, std::memory_order_seq_cst)) {
           slot.record = std::move(r);
@@ -147,7 +162,7 @@ class AsyncSink final : public Sink {
     const std::size_t pos = dequeue_pos_.load(std::memory_order_relaxed);
     Slot& slot = slots_[pos & mask_];
     const std::size_t seq = slot.sequence.load(std::memory_order_acquire);
-    if (static_cast<std::intptr_t>(seq) - static_cast<std::intptr_t>(pos + 1) < 0) return false;
+    if (static_cast<std::intptr_t>(seq - (pos + 1)) < 0) return false;
     out = std::move(slot.record);
     slot.sequence.store(pos + mask_ + 1, std::memory_order_release);
     dequeue_pos_.store(pos + 1, std::memory_order_seq_cst);
@@ -193,7 +208,9 @@ class AsyncSink final : public Sink {
   }
 
   void run(std::stop_token st) {
+    const std::size_t batch_limit = std::min(capacity(), kMaxBatch);
     std::vector<Record> batch;
+    batch.reserve(batch_limit);
     std::size_t batch_end = 0;  // dequeue position after the batch most recently written
     for (;;) {
       for (int i = 0; i < kYieldsBeforeSleep && empty(); ++i) std::this_thread::yield();
@@ -211,7 +228,7 @@ class AsyncSink final : public Sink {
         }
       }
       Record r;
-      while (try_dequeue(r)) batch.push_back(std::move(r));
+      while (batch.size() < batch_limit && try_dequeue(r)) batch.push_back(std::move(r));
       batch_end = dequeue_pos_.load(std::memory_order_relaxed);
       std::atomic_thread_fence(std::memory_order_seq_cst);  // pairs with the producer's fence
       if (producers_waiting_.load(std::memory_order_relaxed) > 0) {

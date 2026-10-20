@@ -97,7 +97,7 @@ int main() {
     async->flush();
     const auto total = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     row("logger -> async -> file sink", caller,
-        std::format("all {} lines on disk after {:.1f} ms ({:.0f} ns/line on the worker)", kCalls,
+        std::format("all {} lines on disk after {:.1f} ms end to end ({:.0f} ns per line)", kCalls,
                     total, total * 1e6 / kCalls));
     std::error_code ec;
     std::filesystem::remove(path, ec);

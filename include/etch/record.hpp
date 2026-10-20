@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <format>
@@ -28,6 +29,15 @@ struct Record {
 };
 
 namespace detail {
+
+// Set by the default logger's exit handler. Sinks that buffer (the file sink) flush every line
+// once it is set, so a static object logging from its destructor still gets its lines on disk.
+// A function-local constant-initialised atomic has nothing to destroy, so it is safe to read at
+// any point of process teardown.
+inline std::atomic<bool>& process_exiting() noexcept {
+  static std::atomic<bool> flag{false};
+  return flag;
+}
 
 // FNV-1a: a stable hash so a logger name maps to the same colour in every run.
 constexpr std::size_t fnv1a(std::string_view text) noexcept {
@@ -134,15 +144,18 @@ inline const std::chrono::time_zone* cached_local_zone() {
 // thread's thread_local objects are gone, still finds valid storage.
 inline void format_time(std::string& out, std::chrono::system_clock::time_point tp, bool utc) {
   using namespace std::chrono;
-  constexpr std::size_t kPrefixCapacity = 32;  // "2026-01-02 03:04:05" is 19, "Z" may follow
+  constexpr std::size_t kPrefixCapacity = 32;  // "2026-01-02 03:04:05" is 19
   struct Cache {
     bool valid = false;
     bool utc = false;
+    bool zulu_suffix = false;  // local time was asked for but no tz database exists: mark it
     seconds::rep key = 0;
     std::size_t length = 0;
-    char prefix[kPrefixCapacity];
+    char prefix[kPrefixCapacity] = {};
   };
-  thread_local Cache cache;
+  // constinit and trivially destructible: plain thread-local memory with no dynamic
+  // initialisation and no destructor, so nothing is torn down before static destructors run.
+  thread_local constinit Cache cache{};
 
   const auto whole_seconds = floor<seconds>(tp);
   const auto key = whole_seconds.time_since_epoch().count();
@@ -153,11 +166,12 @@ inline void format_time(std::string& out, std::chrono::system_clock::time_point 
     const auto* zone = utc ? nullptr : detail::cached_local_zone();
     if (zone != nullptr) {
       r = std::format_to_n(fresh, kPrefixCapacity, "{:%F %T}", zoned_time{zone, whole_seconds});
+      cache.zulu_suffix = false;
     } else
 #endif
     {
-      r = utc ? std::format_to_n(fresh, kPrefixCapacity, "{:%F %T}", whole_seconds)
-              : std::format_to_n(fresh, kPrefixCapacity, "{:%F %T}Z", whole_seconds);
+      r = std::format_to_n(fresh, kPrefixCapacity, "{:%F %T}", whole_seconds);
+      cache.zulu_suffix = !utc;
     }
     // Commit only after formatting succeeded, so a throw leaves the old entry intact.
     const auto length = static_cast<std::size_t>(r.out - fresh);
@@ -170,6 +184,7 @@ inline void format_time(std::string& out, std::chrono::system_clock::time_point 
   out.append(cache.prefix, cache.length);
   std::format_to(std::back_inserter(out), ".{:03}",
                  duration_cast<milliseconds>(tp - whole_seconds).count());
+  if (cache.zulu_suffix) out += 'Z';
 }
 
 // Appends one record as a single line (no trailing newline):
