@@ -127,6 +127,7 @@ class Logger {
  public:
   using Options = LoggerOptions;
   using SinkList = std::vector<std::shared_ptr<Sink>>;
+  class Entry;
 
   explicit Logger(std::string name, SinkList sinks = {}, Options options = Options{})
       : name_(std::move(name)), sinks_(share(std::move(sinks))), options_(options) {}
@@ -207,11 +208,23 @@ class Logger {
     log_at<Level::kFatal>(fmt, std::forward<Args>(args)...);
   }
 
+  // Attaches structured fields to one log call: log.with({{"fps", 59.2}}).warn("slow frame").
+  // Text output appends them as key=value; JSON output gets them as a "fields" object.
+  Entry with(Fields fields) &;
+
   // Dumps raw memory. The pointer overload takes anything; the range overload takes any
-  // contiguous container (std::vector, std::array, std::string, std::span, ...).
+  // contiguous container (std::vector, std::array, std::string, std::span, ...). The text is
+  // the hex editor view; the record also carries the bytes themselves for the JSON output.
   void hexdump(Level level, std::string_view label, const void* data, std::size_t size,
                std::source_location where = std::source_location::current()) {
-    if (enabled(level)) emit(level, where, format_hexdump(label, data, size));
+    if (!enabled(level)) return;
+    Record r;
+    r.level = level;
+    r.where = where;
+    r.message = format_hexdump(label, data, size);
+    const auto* first = static_cast<const std::byte*>(data);
+    r.bytes.assign(first, first + size);
+    emit(std::move(r));
   }
   template <std::ranges::contiguous_range R>
     requires std::ranges::sized_range<R>
@@ -237,14 +250,22 @@ class Logger {
   // logger's level like every other entry point. An exception thrown by a sink propagates out
   // of the log call, and the sinks after it are skipped; AsyncSink is the one that catches.
   void emit(Level level, const std::source_location& where, std::string message) {
+    Record r;
+    r.level = level;
+    r.where = where;
+    r.message = std::move(message);
+    emit(std::move(r));
+  }
+
+  // Same, for a record that already carries extras (fields, bytes, a duration). Fills in the
+  // time, thread and logger name.
+  void emit(Record r) {
+    const Level level = r.level;
     if (!enabled(level)) return;
-    Record r{level,
-             std::chrono::system_clock::now(),
-             std::this_thread::get_id(),
-             where,
-             name_,
-             std::move(message)};
-    if (level == Level::kFatal && options_.stacktrace_on_fatal) append_stacktrace(r.message);
+    r.time = std::chrono::system_clock::now();
+    r.thread = std::this_thread::get_id();
+    r.logger_name = name_;
+    if (level == Level::kFatal && options_.stacktrace_on_fatal) append_stacktrace(r);
     const auto sinks = snapshot();
     // Every sink but the last gets a copy; the last takes the record itself, so the common
     // single-sink setup never copies the message.
@@ -271,18 +292,20 @@ class Logger {
     return sinks_;
   }
 
-  static void append_stacktrace(std::string& message) {
+  // Appends the frames to the message for people and keeps them as a list for the JSON output.
+  static void append_stacktrace(Record& r) {
 #if ETCH_HAS_STACKTRACE
     // Skip this function and emit(); the rest is the caller's chain. In optimised builds the
     // compiler may inline either one, which only changes which frames appear, never the order.
     constexpr std::size_t kOwnFrames = 2;
-    message += "\n  stacktrace:";
+    r.message += "\n  stacktrace:";
     for (const auto& entry : std::stacktrace::current(kOwnFrames)) {
-      message += "\n    ";
-      message += std::to_string(entry);
+      r.stack.push_back(std::to_string(entry));
+      r.message += "\n    ";
+      r.message += r.stack.back();
     }
 #else
-    message += "\n  stacktrace: not available on this standard library";
+    r.message += "\n  stacktrace: not available on this standard library";
 #endif
   }
 
@@ -302,11 +325,66 @@ inline ScopeTimer::ScopeTimer(Logger& logger, Level level, std::string what,
 inline ScopeTimer::~ScopeTimer() {
   if (!logger_.enabled(level_)) return;
   try {
-    logger_.emit(level_, where_, std::format("{}: done in {}", what_, format_duration(elapsed())));
+    const auto took = elapsed();
+    Record r;
+    r.level = level_;
+    r.where = where_;
+    r.message = std::format("{}: done in {}", what_, format_duration(took));
+    r.duration = took;
+    logger_.emit(std::move(r));
   } catch (...) {
     // A destructor must not throw; a sink that does (a user callback) loses this one line.
   }
 }
+
+// The result of Logger::with(): the same six calls, with the fields attached to the record.
+class Logger::Entry {
+ public:
+  Entry(Logger& logger, Fields fields) : logger_(logger), fields_(std::move(fields)) {}
+
+  template <Level L, class... Args>
+  void log_at(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
+    if constexpr (L >= kCompileTimeMinLevel) {
+      if (!logger_.enabled(L)) return;
+      Record r;
+      r.level = L;
+      r.where = fmt.where;
+      r.message = std::vformat(fmt.format.get(), std::make_format_args(args...));
+      r.fields = std::move(fields_);
+      logger_.emit(std::move(r));
+    }
+  }
+  template <class... Args>
+  void trace(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
+    log_at<Level::kTrace>(fmt, std::forward<Args>(args)...);
+  }
+  template <class... Args>
+  void debug(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
+    log_at<Level::kDebug>(fmt, std::forward<Args>(args)...);
+  }
+  template <class... Args>
+  void info(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
+    log_at<Level::kInfo>(fmt, std::forward<Args>(args)...);
+  }
+  template <class... Args>
+  void warn(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
+    log_at<Level::kWarn>(fmt, std::forward<Args>(args)...);
+  }
+  template <class... Args>
+  void error(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
+    log_at<Level::kError>(fmt, std::forward<Args>(args)...);
+  }
+  template <class... Args>
+  void fatal(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
+    log_at<Level::kFatal>(fmt, std::forward<Args>(args)...);
+  }
+
+ private:
+  Logger& logger_;
+  Fields fields_;
+};
+
+inline Logger::Entry Logger::with(Fields fields) & { return Entry(*this, std::move(fields)); }
 
 // A process-wide logger named "main" that writes to the console. Swap its sinks with
 // default_logger().set_sinks(...) to send it elsewhere.

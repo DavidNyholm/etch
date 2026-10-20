@@ -131,9 +131,34 @@ MUTATIONS = [
     ),
     ("logger.hpp", "null sinks are kept in the list", [("std::erase(sinks, nullptr);", "")]),
     (
+        "json.hpp",
+        "JSON message is not escaped",
+        [("json_string(r.message, out);", "out += r.message;")],
+    ),
+    (
+        "json.hpp",
+        "JSON drops the fields",
+        [("  if (!r.fields.empty()) {", "  if (false) {")],
+    ),
+    (
+        "json.hpp",
+        "JSON drops the duration",
+        [("  if (r.duration.has_value())", "  if (false)")],
+    ),
+    (
+        "record.hpp",
+        "text output drops the fields",
+        [("  for (const auto& field : r.fields) {", "  for (const auto& field : Fields{}) {")],
+    ),
+    (
         "logger.hpp",
         "emit skips the level check",
-        [("if (!enabled(level)) return;\n    Record r{", "Record r{")],
+        [
+            (
+                "    if (!enabled(level)) return;\n    r.time = std::chrono::system_clock::now();",
+                "    r.time = std::chrono::system_clock::now();",
+            )
+        ],
     ),
 ]
 

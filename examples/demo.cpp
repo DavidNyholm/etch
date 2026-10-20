@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <print>
 #include <string>
@@ -168,6 +169,35 @@ void section_async(const DemoArgs& args) {
   std::println("   -> {}", std::filesystem::absolute(path).string());
 }
 
+void section_json(const DemoArgs& args) {
+  heading("9. JSON Lines: the same events as data, for agents, log viewers and scripts");
+  auto path = args.file;
+  path.replace_extension(".jsonl");
+  auto file = etch::FileSink::open(path, {.truncate = true});
+  if (!file) {
+    std::println("   could not open {}: {}", path.string(), file.error().message());
+    return;
+  }
+  (*file)->set_style(etch::LineStyle{.format = etch::LineFormat::kJson});
+  etch::Logger log{"json", {*file}};
+  log.with({{"fps", 41.7}, {"level_name", "forest"}, {"entities", 1204}})
+      .warn("frame budget exceeded");
+  const PacketHeader header;
+  log.hexdump(etch::Level::kDebug, "PacketHeader", &header, sizeof header);
+  {
+    auto timer = log.scope("load", etch::Level::kInfo);
+  }
+  log.flush();
+  std::ifstream in(path);
+  std::string line;
+  int shown = 0;
+  while (shown < 2 && std::getline(in, line)) {
+    std::println("   {}", line);
+    ++shown;
+  }
+  std::println("   ... -> {}", std::filesystem::absolute(path).string());
+}
+
 void section_fatal(etch::Logger& log) {
   heading("8. Fatal: highlighted, flushed, with a stacktrace (no abort, that is your call)");
   log.fatal("simulated fatal error, exit code would be {}", 3);
@@ -189,6 +219,7 @@ int main(int argc, char** argv) {
   section_levels_and_filters(log);
   section_file(args);
   section_async(args);
+  section_json(args);
   section_fatal(log);
   return 0;
 }

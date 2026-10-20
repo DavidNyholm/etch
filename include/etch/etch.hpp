@@ -10,6 +10,7 @@
 #pragma once
 
 #include "async_sink.hpp"
+#include "json.hpp"
 #include "level.hpp"
 #include "logger.hpp"
 #include "record.hpp"

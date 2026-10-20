@@ -6,12 +6,16 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <iterator>
+#include <optional>
 #include <source_location>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <variant>
+#include <vector>
 
 #include "level.hpp"
 
@@ -19,14 +23,32 @@ namespace etch {
 
 // Everything a sink needs to know about one log call. Owns its strings, so it can outlive the
 // call (the async sink queues records across threads).
+// A structured key/value attached to a record with Logger::with(). Integers wider than
+// int64, and unsigned ones, need an explicit cast; the variant refuses narrowing.
+using FieldValue = std::variant<std::int64_t, double, bool, std::string>;
+struct Field {
+  std::string key;
+  FieldValue value;
+};
+using Fields = std::vector<Field>;
+
+// Everything a sink needs to know about one log call. Owns its strings, so it can outlive the
+// call (the async sink queues records across threads). The message is what a person reads; the
+// members after it carry the same information as data, for the JSON output.
 struct Record {
   Level level{};
   std::chrono::system_clock::time_point time{};
   std::thread::id thread{};
   std::source_location where{};
   std::string logger_name;
-  std::string message;  // already formatted; may contain newlines (hexdump, stacktrace)
+  std::string message;             // already formatted; may contain newlines (hexdump, stacktrace)
+  Fields fields;                   // from Logger::with()
+  std::vector<std::byte> bytes;    // the complete data behind a hexdump
+  std::vector<std::string> stack;  // the stacktrace behind a fatal, one entry per frame
+  std::optional<std::chrono::nanoseconds> duration;  // a scope timer's elapsed time
 };
+
+enum class LineFormat { kText, kJson };
 
 namespace detail {
 
@@ -100,6 +122,7 @@ struct LineStyle {
   bool location = true;  // file:line, file shortened to its base name
   bool colour = false;   // ANSI colour from the palette below
   Palette palette{};
+  LineFormat format = LineFormat::kText;  // kJson: one JSON object per record, see json.hpp
 };
 
 namespace detail {
@@ -187,6 +210,26 @@ inline void format_time(std::string& out, std::chrono::system_clock::time_point 
   if (cache.zulu_suffix) out += 'Z';
 }
 
+// key=value as a person reads it: strings quoted, numbers and booleans bare.
+inline void append_field_text(const Field& field, std::string& out) {
+  out += field.key;
+  out += '=';
+  std::visit(
+      [&](const auto& v) {
+        using T = std::remove_cvref_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, std::string>) {
+          out += '"';
+          out += v;
+          out += '"';
+        } else if constexpr (std::is_same_v<T, bool>) {
+          out += v ? "true" : "false";
+        } else {
+          std::format_to(std::back_inserter(out), "{}", v);
+        }
+      },
+      field.value);
+}
+
 // Appends one record as a single line (no trailing newline):
 //   2026-10-20 18:19:58.582 INFO  [main] [37036] demo.cpp:42: message
 // Sinks pass the same string every time, so a steady stream of lines allocates nothing.
@@ -223,6 +266,10 @@ inline void format_line(const Record& r, const LineStyle& s, std::string& out) {
     out += ' ';
   }
   wrap(p.message_colour(r.level), [&] { out += r.message; });
+  for (const auto& field : r.fields) {
+    out += ' ';
+    append_field_text(field, out);
+  }
 }
 
 inline std::string format_line(const Record& r, const LineStyle& s) {

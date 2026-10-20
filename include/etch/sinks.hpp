@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+#include "json.hpp"
 #include "record.hpp"
 
 #if defined(_WIN32)
@@ -153,7 +154,7 @@ class ConsoleSink final : public Sink {
   void write(const Record& r) override {
     std::lock_guard lock(mutex_);
     line_.clear();
-    format_line(r, style_, line_);  // reuses one buffer: no allocation per line
+    format_record(r, style_, line_);  // reuses one buffer: no allocation per line
     try {
       std::println(stream_, "{}", line_);  // std::print writes UTF-8 correctly to a Windows console
     } catch (const std::exception&) {
@@ -234,7 +235,7 @@ class FileSink final : public Sink {
   void write(const Record& r) override {
     std::lock_guard lock(mutex_);
     line_.clear();
-    format_line(r, style_, line_);  // reuses one buffer: no allocation per line
+    format_record(r, style_, line_);  // reuses one buffer: no allocation per line
     line_ += '\n';
     // A failed reopen (after a rotation, say) must not disable logging for good: try again.
     if (!out_.is_open() && reopen(/*truncate=*/false)) {

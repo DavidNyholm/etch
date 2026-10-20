@@ -17,7 +17,7 @@ build\windows\Debug\etch_demo.exe
 
 On Linux use the `linux` preset in the same three commands and run `build/linux/etch_demo`. The `windows-release` and `linux-release` presets build optimised binaries (into `build\windows\Release` and `build/linux-release`), which is where `etch_bench` is worth running.
 
-The demo prints one line per severity in colour, four loggers with their own name colours, formatted values, a hexdump, a scope timer, a filtered line, writes a rotating log file and an async burst from four threads, and ends with a fatal line carrying a stacktrace. `--no-colour` turns colour off, `--colour` forces it on when piping to a file, `--burst N` sets the lines per thread in the async section. The log files land in the current directory as `etch-demo.log`, `etch-demo.log.1`, `etch-demo.log.2` and `etch-demo.async.log`.
+The demo prints one line per severity in colour, four loggers with their own name colours, formatted values, a hexdump, a scope timer, a filtered line, writes a rotating log file, an async burst from four threads and a JSON Lines file, and ends with a fatal line carrying a stacktrace. `--no-colour` turns colour off, `--colour` forces it on when piping to a file, `--burst N` sets the lines per thread in the async section. The log files land in the current directory as `etch-demo.log`, `etch-demo.log.1`, `etch-demo.log.2`, `etch-demo.async.log` and `etch-demo.jsonl`.
 
 To use it in a project, add the folder with `add_subdirectory` and link `etch::etch`, or copy `include/etch` into your include path (on GCC, link `stdc++exp` yourself for `std::stacktrace`).
 
@@ -33,6 +33,7 @@ log.warn("fps dropped to {:.1f}", fps);                   // file:line captured,
 log.hexdump(etch::Level::kDebug, "packet", buffer);       // any contiguous container
 auto timer = log.scope("load level");                     // "load level: done in 12.3 ms"
 log.fatal("out of memory");                               // highlighted, flushed, stacktrace
+log.with({{"fps", 41.7}, {"entities", 1204}}).warn("slow");  // structured fields
 ```
 
 ```
@@ -49,6 +50,13 @@ log.fatal("out of memory");                               // highlighted, flushe
     examples\demo.cpp(197): etch_demo!main+0x33E
 ```
 
+With `LineStyle{.format = etch::LineFormat::kJson}` on a file or console sink, the same records come out as JSON Lines, one object per record, with everything the text view compresses: the full payload behind a hexdump, every stack frame, exact durations, and the fields as a nested object.
+
+```
+{"ts":"2026-10-20T19:38:13.091Z","level":"warn","logger":"json","thread":"30392","pid":4120,"file":"demo.cpp","line":154,"path":"...","func":"...","msg":"frame budget exceeded","fields":{"fps":41.7,"level_name":"forest","entities":1204}}
+{"ts":"2026-10-20T19:38:13.091Z","level":"debug", ... ,"msg":"PacketHeader (24 bytes)\n  0000  45 43 ...","bytes":"4543544802000180390500006865 ..."}
+```
+
 In a terminal the timestamp, thread and location are dimmed, the level tag is coloured, each logger name gets a stable colour of its own (hashed from the name), warnings are yellow, errors red, and a fatal line is bold red on a red tag. Only the sixteen standard colours are used, so it looks the same in Windows Terminal, conhost and any Linux terminal. The whole palette is one struct on the sink's `LineStyle`, so every colour can be changed.
 
 ## What it does
@@ -58,7 +66,9 @@ In a terminal the timestamp, thread and location are dimmed, the level tag is co
 - **File and line without macros.** `log.info("x = {}", x)` knows where it was called from. The format string type carries a `std::source_location` taken as a default argument of a `consteval` constructor.
 - **Sinks:** console (ANSI colour, auto-detected, honours `NO_COLOR`), file (append, size-based rotation keeping N old files, I/O failures counted rather than thrown), memory (the last N records, for tests and crash dumps) and a callback for anything else. A logger can have any number of sinks, sinks can be shared between loggers, and the sink list can be replaced while other threads are logging.
 - **Async sink:** a bounded ring queue and one worker thread in front of any other sink. A log call claims a slot with one compare-and-swap and moves the record in; it takes no lock and allocates nothing (a successful call may still briefly take a mutex to wake a sleeping worker). When the queue is full it either blocks the caller (lose nothing) or drops the record and counts it (never blocks a game loop on a full queue). `flush()` waits for exactly the records logged before it, not for the queue to go idle, and returns when the worker finishes the batch holding them. Destroying it drains the queue first, so nothing logged before shutdown is lost. A sink that throws costs that one record and is counted; the worker carries on.
-- **Hexdump** of any memory in the classic hex editor layout: offset, sixteen bytes with a gap after eight, ASCII column.
+- **Hexdump** of any memory in the classic hex editor layout: offset, sixteen bytes with a gap after eight, ASCII column. The record also keeps the bytes themselves.
+- **Structured fields.** `log.with({{"fps", 41.7}, {"name", "forest"}}).warn("slow frame")` attaches typed key/values (integer, double, bool, string). Text output appends them as `key=value`; JSON output gets a `fields` object.
+- **JSON Lines output** from any file or console sink (`LineStyle::format`), with the same rotation and failure accounting as text. Each line is one object: ISO 8601 UTC timestamp, level, logger, thread, pid, file, line, path, function, message, and when present fields, `duration_ns`, `bytes` (hex) and `stack` (one string per frame). Strings are escaped so a message with a newline is still one line.
 - **Scope timer:** `auto t = log.scope("name")` logs when it begins and how long it took when it ends.
 - **Fatal** appends a `std::stacktrace` and flushes every sink. It does not abort; that is the caller's decision.
 - **Errors come back as values.** Opening a file sink returns `std::expected` with the OS error code. After that, file and console I/O never throw out of a log call: refused writes, flushes, closes and rotations are counted on the sink (`write_failures()`) and it keeps trying, reopening a file it lost. Formatting, allocation and a user callback can still throw, and that exception reaches the caller of the log call; the async sink is the exception and catches, counts and carries on.
@@ -79,7 +89,9 @@ The same logger serves two readers. A person scans a terminal or a log file afte
 
 **For an agent**, use the parts that are exact and machine-checkable, and avoid the parts made for eyes:
 
-- **`MemorySink`** in tests. `records()` gives the level, time, thread, source location and message of each record as data; `messages()` gives just the text. Assert on those, not on console output. That is how the suite in `tests/tests.cpp` works, and it is the fastest sink (about 200 ns a call).
+- **A JSON Lines file** (`LineStyle{.format = etch::LineFormat::kJson}` on a `FileSink`) when the output must be read by a program after the fact. Every line is one object with the full data: the whole payload behind a hexdump, every stack frame, exact durations, the fields you attached. The text view truncates or formats those for eyes; the JSON view does not.
+- **`MemorySink`** in tests. `records()` gives the level, time, thread, source location, message, fields, bytes, stack and duration of each record as data; `messages()` gives just the text. Assert on those, not on console output. That is how the suite in `tests/tests.cpp` works, and it is the fastest sink (about 200 ns a call).
+- **`with()` fields** for anything a program will want to filter or aggregate on: `log.with({{"request_id", id}, {"ms", took}}).info("done")`. They survive as typed JSON values, not as text to re-parse.
 - **`CallbackSink`** to route records into anything else: a test probe, a channel to another process, a JSON writer. The callback runs under the sink's mutex and must not log back into the same sink.
 - **A file sink with colour off** (it is off by default) when output must survive the process, and a `LineStyle` with `utc = true` so timestamps compare across machines. Lines are LF-terminated on every platform and the layout is fixed: `time LEVEL [logger] [thread] file:line: message`. The level column is always five characters, so it can be sliced, and `parse_level` reads it back.
 - **`NO_COLOR=1`** or `ConsoleSink::ColourMode::kNever` when capturing the console in a pipe, so no escape sequences land in the capture. The demo's `--no-colour` flag does the same.
@@ -98,6 +110,7 @@ For an agent working on etch itself: `ctest --preset windows` is the oracle, `py
 - **The timestamp is cached per second.** Formatting a `std::chrono::zoned_time` costs about 16 microseconds on MSVC's standard library, more than everything else in a log line put together. The date and time down to the second change once a second, so each thread keeps that prefix in a plain char array (no destructor, so it is still valid when a static object logs from its destructor) and only formats the milliseconds per call.
 - **The default logger is never destroyed**, on purpose, so objects with static storage can log from their destructors. An `atexit` handler flushes its sinks.
 - **`std::print` for console output.** It is the only standard way to get UTF-8 onto a Windows console correctly; `printf` and `std::cout` mangle it.
+- **JSON is the same record, serialised.** The record carries the human text and the data side by side (message plus bytes, stack, duration, fields), so a text sink and a JSON sink on the same logger show the same event two ways. The JSON writer is a hundred lines with no dependency; the test suite checks every line it produces with a small validator and compares a fixed record against an exact expected string.
 
 ## Performance
 
@@ -122,16 +135,17 @@ Not measured: Clang or libc++, tail latency (the benchmark reports averages), or
 
 ## How it is checked
 
-Forty-nine tests (forty-eight on Linux; the refused-rotation test relies on Windows file locking), written against a tiny harness in `tests/check.hpp` so the suite needs no framework. CTest runs the suite twice: once as built, and once with `ETCH_MIN_LEVEL=3` so the compile-time floor is exercised for real rather than assumed. Each run uses its own scratch directory, so the two can run in parallel. The same suite passes on MSVC and GCC 14, Debug and Release.
+Fifty-seven tests (fifty-six on Linux; the refused-rotation test relies on Windows file locking), written against a tiny harness in `tests/check.hpp` so the suite needs no framework and split by area under `tests/`. CTest runs the suite twice: once as built, and once with `ETCH_MIN_LEVEL=3` so the compile-time floor is exercised for real rather than assumed. Each run uses its own scratch directory, so the two can run in parallel. The same suite passes on MSVC and GCC 14, Debug and Release.
 
 - **Exact output.** The line layout, the hexdump (including the last partial line and the wide offsets past 64 KiB), every colour escape, the name palette, and the duration formatting are compared against exact strings.
 - **Source location.** The captured line equals the `__LINE__` of the call, and the file column is the base name.
 - **Time.** UTC rendering of a fixed instant is exact; local time differs only by the zone; the per-second cache is driven across a second, minute, hour and day boundary and across a UTC/local switch in the same second.
 - **File sink.** Lines on disk equal the lines logged byte for byte and the file size equals the sink's byte count (binary mode, so no CRLF surprise); append across two opens counts the old bytes; rotation at a small size keeps every line across the numbered files, drops the oldest beyond `max_files`, and with `max_files = 0` just restarts the file; a rotation whose rename is refused (on Windows, another handle holds the target open) counts the failure and keeps every line in the live file; a missing directory comes back as an error value.
 - **Async.** Eight threads log 4,000 lines through a 64-slot queue: all arrive and each thread's lines stay in order. With the drop policy, dropped plus delivered equals sent. `flush()` and the destructor both wait for the queue to drain, and `flush()` returns while another thread keeps logging. The blocking policy never drops. The inner sink's level is honoured. A sink that throws is counted and the records after it still arrive.
+- **JSON.** Escaping of quotes, backslashes, control characters and UTF-8 is exact; a fixed record serialises to an exact expected line; every field type renders (non-finite doubles become `null`); fields, hexdump bytes, a scope's duration and a fatal's stack frames all appear; and every line the file sink writes passes a small JSON validator that is itself tested against malformed input.
 - **Logger.** Runtime filter, sink filter, compile-time floor, `emit` honouring the level, name round trips, lenient parsing (`warning`, `err`, `INFO `), null sinks ignored, `scope()` rejected on a temporary logger (a concept checked at compile time), sinks replaced 600 times while four threads log, and a callback that adds a sink from inside a log call.
 
-**Tests against deliberate bugs.** `tools/mutate.py` injects nineteen bugs one at a time (level filters off by one in the logger and the sink, the parser rejecting full names, the time cache ignoring the UTC flag or the second, the location column printing the full path, a lost warn colour, the memory sink keeping one record too many, rotation deleting the live file, rotation never happening, text-mode file output, uncounted drops, the async sink ignoring the inner level, an uncounted sink exception, `flush` waiting for idleness, the hexdump losing its gap, the scope timer's message changing, null sinks kept, and `emit` skipping the level check), rebuilds the tests and runs them. The suite catches every one, each with at least one failing test that names the broken behaviour. Run it after `cmake --preset windows`:
+**Tests against deliberate bugs.** `tools/mutate.py` injects twenty-three bugs one at a time (level filters off by one in the logger and the sink, the parser rejecting full names, the time cache ignoring the UTC flag or the second, the location column printing the full path, a lost warn colour, the memory sink keeping one record too many, rotation deleting the live file, rotation never happening, text-mode file output, uncounted drops, the async sink ignoring the inner level, an uncounted sink exception, `flush` waiting for idleness, the hexdump losing its gap, the scope timer's message changing, null sinks kept, `emit` skipping the level check, an unescaped JSON message, JSON without its fields or duration, and text output without its fields), rebuilds the tests and runs them. The suite catches every one, each with at least one failing test that names the broken behaviour. Run it after `cmake --preset windows`:
 
 ```bash
 python tools/mutate.py
@@ -147,13 +161,16 @@ A second round on the fixed code confirmed that both wake-up handshakes in the q
 include/etch/etch.hpp        include this; pulls in the rest
 include/etch/level.hpp       Level, names, parsing, ETCH_MIN_LEVEL, std::formatter<Level>
 include/etch/record.hpp      Record, Palette, LineStyle, timestamp cache, format_line
+include/etch/json.hpp        JSON Lines: json_escape, format_json, format_record
 include/etch/sinks.hpp       Sink, ConsoleSink, FileSink, MemorySink, CallbackSink
 include/etch/async_sink.hpp  AsyncSink: lock-free ring + worker thread
 include/etch/logger.hpp      Logger, FormatWithLocation, hexdump, ScopeTimer, default logger
 examples/demo.cpp            every feature, in order
 bench/bench.cpp              what one call costs the calling thread
 tests/check.hpp              the test harness (TEST, CHECK, CHECK_EQ)
-tests/tests.cpp              the suite
+tests/support.hpp            shared test helpers: capturing logger, scratch dir, fixed record
+tests/test_*.cpp             the suite, one file per area (levels/logger, format, sinks, async, JSON)
+tests/main.cpp               test entry point
 tools/mutate.py              tests against deliberate bugs
 ```
 
@@ -172,4 +189,4 @@ All rights reserved. The source is public to read and evaluate, not to reuse. Se
 3. ~~Colour palette, per-logger name colours~~
 4. ~~Build and test on Linux (WSL, GCC 14)~~
 5. Deferred formatting: queue the arguments instead of the formatted text, so the caller pays only a copy
-6. Structured output (JSON lines) as a sink option
+6. ~~Structured output (JSON lines) as a sink option, with typed fields~~
