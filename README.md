@@ -161,6 +161,10 @@ A third round, asked for speed and for what a model reading the logs would want,
 
 A second round on the fixed code confirmed that both wake-up handshakes in the queue are correctly ordered under the C++ memory model, and found the worker's sweep being unbounded (a fast producer could refill slots as fast as the worker freed them, so it would collect forever and never write), a signed overflow in the slot arithmetic after 2^63 records, close-time failures hidden by rotation, a failed reopen disabling the file sink for good, console flush failures going uncounted, the UTC-fallback marker landing before the milliseconds, and `std::bit_ceil` on an absurd capacity. All of those are fixed; the one remaining contract is that a sink behind the async sink must not drop the async sink's last reference from inside a callback.
 
+## Branches
+
+`main` holds verified states only: every commit on it has passed the full suite on Windows and Linux, the injected-bug script, and a review round. Day-to-day work happens on `beta`, which is merged into `main` once a batch of features is done and checked. If you want the latest, build `beta`; if you want something that is known to work, build `main`.
+
 ## Layout
 
 ```
