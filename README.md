@@ -65,6 +65,29 @@ In a terminal the timestamp, thread and location are dimmed, the level tag is co
 
 What it does not do: defer formatting (the message is formatted on the calling thread, about 120 ns), guarantee anything about power loss, or let a sink's callback log back into the same sink (every sink holds a non-recursive mutex while writing, so that deadlocks; it is documented on `Sink`).
 
+## Who reads what
+
+The same logger serves two readers. A person scans a terminal or a log file after the fact. An agent (Claude Code, Codex, a CI job, a test) reads the output programmatically and must not depend on colour or timing. Set the project up so each gets what it needs.
+
+**For a human reviewer**, the console sink in a terminal is the view, and these are the parts worth attention:
+
+- **`warn` and above.** Set the console sink's level to `warn` once things work, and keep `info` for the file. A tinted message means something went wrong; a bold red one with a stacktrace means the process is about to stop.
+- **The logger name colour.** Four subsystems logging at once are told apart by colour before you read a word. Give each subsystem its own `Logger` with a short name.
+- **Scope timers** (`log.scope("load level")`) for anything that might be slow. The "done in" line is the first place to look when a frame hitches.
+- **Hexdumps** when a parser or a network packet misbehaves. The ASCII column shows at a glance whether you are looking at text, a header or garbage.
+- **The counters** when logging itself is suspect: `dropped()` on an async sink, `write_failures()` on a file or console sink, `rotations()` on a file sink. A non-zero number is the explanation for a missing line.
+
+**For an agent**, use the parts that are exact and machine-checkable, and avoid the parts made for eyes:
+
+- **`MemorySink`** in tests. `records()` gives the level, time, thread, source location and message of each record as data; `messages()` gives just the text. Assert on those, not on console output. That is how the suite in `tests/tests.cpp` works, and it is the fastest sink (about 200 ns a call).
+- **`CallbackSink`** to route records into anything else: a test probe, a channel to another process, a JSON writer. The callback runs under the sink's mutex and must not log back into the same sink.
+- **A file sink with colour off** (it is off by default) when output must survive the process, and a `LineStyle` with `utc = true` so timestamps compare across machines. Lines are LF-terminated on every platform and the layout is fixed: `time LEVEL [logger] [thread] file:line: message`. The level column is always five characters, so it can be sliced, and `parse_level` reads it back.
+- **`NO_COLOR=1`** or `ConsoleSink::ColourMode::kNever` when capturing the console in a pipe, so no escape sequences land in the capture. The demo's `--no-colour` flag does the same.
+- **Levels as data.** `log.log(level, ...)` takes the level at runtime, and `std::formatter<Level>` prints it, so a severity mapped from an error code needs no switch.
+- **Never scrape the colour or the thread id.** Both are for people; the thread id differs per run and per platform.
+
+For an agent working on etch itself: `ctest --preset windows` is the oracle, `python tools/mutate.py` checks the oracle has teeth, and `etch_bench` (Release) is how a performance claim is backed. A change to a header is done when all three say so.
+
 ## How it works
 
 - **Format once, on the calling thread.** A log call formats the message with `std::vformat`, stamps it with the time, thread id, source location and logger name, and hands that `Record` to each sink. The record owns its strings, which is what lets the async sink move it to another thread safely. With one sink, the record is moved, not copied.
