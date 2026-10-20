@@ -1,0 +1,18 @@
+# Build output: generate it yourself with cmake --preset <windows|linux>
+build/
+out/
+.vs/
+.vscode/
+CMakeUserPresets.json
+
+# Files the demo writes
+*.log
+*.log.[0-9]*
+
+# Local agent tooling, not part of the project
+.claude/
+.agent-style.toml
+.clang-format
+AGENTS.md
+CLAUDE.md
+RESEARCH.md
