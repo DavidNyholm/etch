@@ -101,8 +101,40 @@ TEST(local_time_differs_from_utc_only_by_the_zone_offset) {
   etch::format_time(local, r.time, false);
   etch::format_time(utc, r.time, true);
   CHECK_EQ(utc, std::string("2026-01-02 03:04:05.678"));
-  CHECK(local.size() == utc.size() || local == utc + "Z");  // "Z": no tz database here
-  CHECK(local.find(".678") != std::string::npos);           // the sub-second part is untouched
+#if ETCH_HAS_TIME_ZONES
+  // Independent expectation: the standard's own zoned formatting of the same instant.
+  if (const auto* zone = etch::detail::cached_local_zone()) {
+    using namespace std::chrono;
+    const auto expected = std::format("{:%F %T}", zoned_time{zone, floor<milliseconds>(r.time)});
+    CHECK_EQ(local, expected);
+  } else {
+    CHECK_EQ(local, utc + "Z");
+  }
+#else
+  CHECK_EQ(local, utc + "Z");
+#endif
+}
+
+TEST(text_fields_escape_quotes_backslashes_and_newlines) {
+  auto r = fixed_record();
+  r.fields = {{"q", std::string("say \"hi\" and\nmore \\ done")}};
+  const etch::LineStyle bare{.time = false, .thread = false, .name = false, .location = false};
+  CHECK_EQ(etch::format_line(r, bare),
+           std::string("INFO  hello q=\"say \\\"hi\\\" and\\nmore \\\\ done\""));
+}
+
+TEST(two_timestamp_modes_on_one_thread_keep_their_own_cache) {
+  // A text sink (local) and a JSON sink (UTC) format the same instant in turn; each mode must
+  // reproduce its own result, which fails if one cache entry serves both.
+  const auto r = fixed_record();
+  std::string local1, utc1, local2, utc2;
+  etch::format_time(local1, r.time, false);
+  etch::format_time(utc1, r.time, true);
+  etch::format_time(local2, r.time, false);
+  etch::format_time(utc2, r.time, true);
+  CHECK_EQ(local1, local2);
+  CHECK_EQ(utc1, utc2);
+  CHECK_EQ(utc1, std::string("2026-01-02 03:04:05.678"));
 }
 
 }  // namespace

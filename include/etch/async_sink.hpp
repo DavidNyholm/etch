@@ -56,7 +56,8 @@ namespace etch {
 class AsyncSink final : public Sink {
  public:
   enum class Overflow { kBlock, kDrop };
-  // Slots are allocated up front (about 128 bytes each), so the default stays modest.
+  // Slots are allocated up front (a Record plus a sequence number, 208 bytes on MSVC x64, so
+  // the default ring is about 830 KiB); hence a modest default.
   static constexpr std::size_t kDefaultCapacity = 4096;
   // Upper bound for the ring: std::bit_ceil must have a representable result, and 2^30 slots
   // is already 128 GB of slot storage.

@@ -50,6 +50,19 @@ struct Record {
 
 enum class LineFormat { kText, kJson };
 
+// What a JSON line carries beyond the always-present ts, level, logger, file, line and msg.
+// The defaults are the cheap, safe set: a program reading the log pays tokens for every key,
+// and the compiler-provided full path can name a user's home directory.
+struct JsonStyle {
+  enum class Time { kIso8601, kEpochMillis };
+  Time time = Time::kIso8601;  // kEpochMillis: "ts":1760985493091, shorter and easy to subtract
+  bool thread = true;
+  bool pid = true;
+  bool path = false;  // full source path as the compiler saw it; off: "file" is the base name
+  bool function =
+      false;  // compiler-decorated function name; long, and rarely needed with file:line
+};
+
 namespace detail {
 
 // Set by the default logger's exit handler. Sinks that buffer (the file sink) flush every line
@@ -123,6 +136,7 @@ struct LineStyle {
   bool colour = false;   // ANSI colour from the palette below
   Palette palette{};
   LineFormat format = LineFormat::kText;  // kJson: one JSON object per record, see json.hpp
+  JsonStyle json{};
 };
 
 namespace detail {
@@ -170,19 +184,21 @@ inline void format_time(std::string& out, std::chrono::system_clock::time_point 
   constexpr std::size_t kPrefixCapacity = 32;  // "2026-01-02 03:04:05" is 19
   struct Cache {
     bool valid = false;
-    bool utc = false;
     bool zulu_suffix = false;  // local time was asked for but no tz database exists: mark it
     seconds::rep key = 0;
     std::size_t length = 0;
     char prefix[kPrefixCapacity] = {};
   };
-  // constinit and trivially destructible: plain thread-local memory with no dynamic
-  // initialisation and no destructor, so nothing is torn down before static destructors run.
-  thread_local constinit Cache cache{};
+  // One cache per mode, so a local-time text sink and a UTC JSON sink on the same thread do not
+  // evict each other on every record. constinit and trivially destructible: plain thread-local
+  // memory with no dynamic initialisation and no destructor, so nothing is torn down before
+  // static destructors run.
+  thread_local constinit Cache caches[2]{};
+  Cache& cache = caches[utc ? 1 : 0];
 
   const auto whole_seconds = floor<seconds>(tp);
   const auto key = whole_seconds.time_since_epoch().count();
-  if (!cache.valid || key != cache.key || utc != cache.utc) {
+  if (!cache.valid || key != cache.key) {
     char fresh[kPrefixCapacity];
     std::format_to_n_result<char*> r{fresh, 0};
 #if ETCH_HAS_TIME_ZONES
@@ -201,16 +217,45 @@ inline void format_time(std::string& out, std::chrono::system_clock::time_point 
     std::copy_n(fresh, length, cache.prefix);
     cache.length = length;
     cache.key = key;
-    cache.utc = utc;
     cache.valid = true;
   }
   out.append(cache.prefix, cache.length);
-  std::format_to(std::back_inserter(out), ".{:03}",
-                 duration_cast<milliseconds>(tp - whole_seconds).count());
+  // The three millisecond digits by hand: this runs once per line, std::format would not be free.
+  const auto ms = duration_cast<milliseconds>(tp - whole_seconds).count();
+  out += '.';
+  out += static_cast<char>('0' + ms / 100);
+  out += static_cast<char>('0' + (ms / 10) % 10);
+  out += static_cast<char>('0' + ms % 10);
   if (cache.zulu_suffix) out += 'Z';
 }
 
-// key=value as a person reads it: strings quoted, numbers and booleans bare.
+// A string inside a text line, quoted, with the quote, backslash, newline and tab escaped so a
+// value cannot pose as another field or another record.
+inline void append_quoted_text(std::string_view text, std::string& out) {
+  out += '"';
+  for (const char c : text) {
+    switch (c) {
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out += c;
+    }
+  }
+  out += '"';
+}
+
+// key=value as a person reads it: strings quoted and escaped, numbers and booleans bare. Keys
+// are written as given; keep them to letters, digits and underscores.
 inline void append_field_text(const Field& field, std::string& out) {
   out += field.key;
   out += '=';
@@ -218,9 +263,7 @@ inline void append_field_text(const Field& field, std::string& out) {
       [&](const auto& v) {
         using T = std::remove_cvref_t<decltype(v)>;
         if constexpr (std::is_same_v<T, std::string>) {
-          out += '"';
-          out += v;
-          out += '"';
+          append_quoted_text(v, out);
         } else if constexpr (std::is_same_v<T, bool>) {
           out += v ? "true" : "false";
         } else {
@@ -237,35 +280,38 @@ inline void format_line(const Record& r, const LineStyle& s, std::string& out) {
   auto app = std::back_inserter(out);
   const Palette& p = s.palette;
   // With colour off every sequence is empty, so one code path serves both cases.
-  const auto colour = [&](std::string_view sgr) { return s.colour ? sgr : std::string_view{}; };
-  const auto wrap = [&](std::string_view sgr, auto&& append_text) {
-    const auto on = colour(sgr);
+  // The colour is asked for lazily (a callable), so with colour off nothing is computed: no
+  // palette lookup and, for the logger name, no hash.
+  const auto wrap = [&](auto&& sgr_of, auto&& append_text) {
+    const std::string_view on = s.colour ? sgr_of() : std::string_view{};
     out += on;
     append_text();
     if (!on.empty()) out += p.reset;
   };
 
   if (s.time) {
-    wrap(p.time, [&] { format_time(out, r.time, s.utc); });
+    wrap([&] { return p.time; }, [&] { format_time(out, r.time, s.utc); });
     out += ' ';
   }
-  wrap(p.level_colour(r.level), [&] { out += to_string(r.level); });
+  wrap([&] { return p.level_colour(r.level); }, [&] { out += to_string(r.level); });
   out += ' ';
   if (s.name) {
-    wrap(p.name_colour(r.logger_name), [&] { std::format_to(app, "[{}]", r.logger_name); });
+    wrap([&] { return p.name_colour(r.logger_name); },
+         [&] { std::format_to(app, "[{}]", r.logger_name); });
     out += ' ';
   }
   if (s.thread) {
-    wrap(p.thread, [&] { std::format_to(app, "[{}]", r.thread); });
+    wrap([&] { return p.thread; }, [&] { std::format_to(app, "[{}]", r.thread); });
     out += ' ';
   }
   if (s.location) {
-    wrap(p.location, [&] {
-      std::format_to(app, "{}:{}:", detail::base_name(r.where.file_name()), r.where.line());
-    });
+    wrap([&] { return p.location; },
+         [&] {
+           std::format_to(app, "{}:{}:", detail::base_name(r.where.file_name()), r.where.line());
+         });
     out += ' ';
   }
-  wrap(p.message_colour(r.level), [&] { out += r.message; });
+  wrap([&] { return p.message_colour(r.level); }, [&] { out += r.message; });
   for (const auto& field : r.fields) {
     out += ' ';
     append_field_text(field, out);

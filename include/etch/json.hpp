@@ -1,10 +1,11 @@
 // etch - JSON Lines output: one JSON object per record, for programs rather than people.
 //
-// A line looks like this (wrapped here; it is one line in the file):
+// A line looks like this with the default JsonStyle (one line in the file):
 //   {"ts":"2026-10-20T19:38:13.091Z","level":"info","logger":"demo","thread":"30392",
-//    "pid":4120,"file":"demo.cpp","line":84,"path":"...","func":"...","msg":"frame 1442 ..."}
+//    "pid":4120,"file":"demo.cpp","line":84,"msg":"frame 1442 ..."}
 // followed, when present, by "fields":{...}, "duration_ns":N, "bytes":"48656c..." (the whole
 // payload behind a hexdump as lowercase hex) and "stack":[...] (one string per frame).
+// JsonStyle adds "path" and "func", drops "thread" and "pid", or makes "ts" epoch milliseconds.
 #pragma once
 
 #include <cmath>
@@ -29,13 +30,24 @@ namespace etch {
 
 namespace detail {
 
+// Cached on Windows, where a process id never changes. Asked for each time on POSIX, because a
+// fork() would otherwise keep reporting the parent's id from the child.
 inline int process_id() noexcept {
 #if defined(_WIN32)
   static const int pid = _getpid();
-#else
-  static const int pid = static_cast<int>(getpid());
-#endif
   return pid;
+#else
+  return static_cast<int>(getpid());
+#endif
+}
+
+// The human text of a hexdump or a fatal has the payload rendered inside it (the dump lines,
+// the frames). The JSON line carries that payload as data, so the message keeps only its first
+// line and nothing is written twice.
+inline std::string_view json_message(const Record& r) noexcept {
+  if (r.bytes.empty() && r.stack.empty()) return r.message;
+  const std::string_view text = r.message;
+  return text.substr(0, text.find('\n'));
 }
 
 constexpr std::string_view json_level_name(Level level) noexcept {
@@ -58,9 +70,10 @@ constexpr std::string_view json_level_name(Level level) noexcept {
 
 }  // namespace detail
 
-// Appends the body of a JSON string (no surrounding quotes). UTF-8 passes through untouched;
-// the quote, the backslash and every control character are escaped, so the record stays one
-// line whatever the message contains.
+// Appends the body of a JSON string (no surrounding quotes). Input is expected to be UTF-8 and
+// passes through untouched, invalid bytes included: the logger does not inspect text, so what
+// a caller logs is what the file holds. The quote, the backslash and every control character
+// are escaped, so the record stays one line whatever the message contains.
 inline void json_escape(std::string_view text, std::string& out) {
   constexpr unsigned char kLastControl = 0x1f;
   constexpr std::string_view kHex = "0123456789abcdef";
@@ -100,7 +113,10 @@ inline void json_string(std::string_view text, std::string& out) {
   out += '"';
 }
 
-// A field value as a JSON value. A double that is not finite has no JSON spelling: null.
+// A field value as a JSON value. A double that is not finite has no JSON spelling: null (NaN,
+// +inf and -inf all become null; log the distinction as a string if it matters). Field keys are
+// written in order and not checked for duplicates; a duplicate key is reader-defined in JSON,
+// so do not attach the same key twice.
 inline void json_value(const FieldValue& value, std::string& out) {
   std::visit(
       [&](const auto& v) {
@@ -132,28 +148,40 @@ inline void format_time_iso8601(std::string& out, std::chrono::system_clock::tim
 }
 
 // Appends one record as a single JSON object, no trailing newline.
-inline void format_json(const Record& r, std::string& out) {
+inline void format_json(const Record& r, const JsonStyle& j, std::string& out) {
   auto app = std::back_inserter(out);
   out += "{\"ts\":";
-  out += '"';
-  format_time_iso8601(out, r.time);
-  out += '"';
+  if (j.time == JsonStyle::Time::kEpochMillis) {
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(r.time.time_since_epoch());
+    std::format_to(app, "{}", ms.count());
+  } else {
+    out += '"';
+    format_time_iso8601(out, r.time);
+    out += '"';
+  }
   out += ",\"level\":";
   json_string(detail::json_level_name(r.level), out);
   out += ",\"logger\":";
   json_string(r.logger_name, out);
-  out += ",\"thread\":";
-  json_string(std::format("{}", r.thread), out);
-  std::format_to(app, ",\"pid\":{}", detail::process_id());
+  if (j.thread) {
+    out += ",\"thread\":";
+    json_string(std::format("{}", r.thread), out);
+  }
+  if (j.pid) std::format_to(app, ",\"pid\":{}", detail::process_id());
   out += ",\"file\":";
   json_string(detail::base_name(r.where.file_name()), out);
   std::format_to(app, ",\"line\":{}", r.where.line());
-  out += ",\"path\":";
-  json_string(r.where.file_name(), out);
-  out += ",\"func\":";
-  json_string(r.where.function_name(), out);
+  if (j.path) {
+    out += ",\"path\":";
+    json_string(r.where.file_name(), out);
+  }
+  if (j.function) {
+    out += ",\"func\":";
+    json_string(r.where.function_name(), out);
+  }
   out += ",\"msg\":";
-  json_string(r.message, out);
+  json_string(detail::json_message(r), out);
   if (!r.fields.empty()) {
     out += ",\"fields\":{";
     bool first = true;
@@ -169,7 +197,12 @@ inline void format_json(const Record& r, std::string& out) {
   if (r.duration.has_value()) std::format_to(app, ",\"duration_ns\":{}", r.duration->count());
   if (!r.bytes.empty()) {
     out += ",\"bytes\":\"";
-    for (const std::byte b : r.bytes) std::format_to(app, "{:02x}", std::to_integer<unsigned>(b));
+    constexpr std::string_view kHex = "0123456789abcdef";
+    for (const std::byte b : r.bytes) {
+      const auto v = std::to_integer<unsigned>(b);
+      out += kHex[v >> 4];
+      out += kHex[v & 0x0f];
+    }
     out += '"';
   }
   if (!r.stack.empty()) {
@@ -185,10 +218,12 @@ inline void format_json(const Record& r, std::string& out) {
   out += '}';
 }
 
+inline void format_json(const Record& r, std::string& out) { format_json(r, JsonStyle{}, out); }
+
 // What every sink calls: the text line or the JSON object, as the style says.
 inline void format_record(const Record& r, const LineStyle& s, std::string& out) {
   if (s.format == LineFormat::kJson) {
-    format_json(r, out);
+    format_json(r, s.json, out);
   } else {
     format_line(r, s, out);
   }

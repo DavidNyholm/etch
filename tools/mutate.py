@@ -30,12 +30,12 @@ MUTATIONS = [
     (
         "record.hpp",
         "time cache ignores the utc flag",
-        [("key != cache.key || utc != cache.utc", "key != cache.key")],
+        [("Cache& cache = caches[utc ? 1 : 0];", "Cache& cache = caches[0];")],
     ),
     (
         "record.hpp",
         "time cache never invalidates on a new second",
-        [("key != cache.key || utc != cache.utc", "utc != cache.utc")],
+        [("if (!cache.valid || key != cache.key) {", "if (!cache.valid) {")],
     ),
     (
         "record.hpp",
@@ -133,7 +133,7 @@ MUTATIONS = [
     (
         "json.hpp",
         "JSON message is not escaped",
-        [("json_string(r.message, out);", "out += r.message;")],
+        [("json_string(detail::json_message(r), out);", "out += detail::json_message(r);")],
     ),
     (
         "json.hpp",
@@ -163,8 +163,28 @@ MUTATIONS = [
 ]
 
 
-def run(args: list[str], cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+BUILD_TIMEOUT_S = 600  # a mutant must not hang the whole run on a broken build
+TEST_TIMEOUT_S = 120  # the suite takes about a second; a hang is a finding of its own
+
+
+def run(args: list[str], timeout: int, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+
+
+def build_and_test(build_args: list[str], binary: Path) -> tuple[str, list[str]]:
+    """Returns (status, failing test names). status: caught, MISSED, BUILD FAILED, TIMED OUT."""
+    try:
+        build = run(build_args, BUILD_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return "TIMED OUT", []
+    if build.returncode != 0:
+        return "BUILD FAILED", []
+    try:
+        test = run([str(binary)], TEST_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return "TIMED OUT", []
+    failing = [line.split(maxsplit=1)[1] for line in test.stdout.splitlines() if line.startswith("  FAIL")]
+    return ("caught" if test.returncode != 0 else "MISSED"), failing
 
 
 def main() -> int:
@@ -177,6 +197,13 @@ def main() -> int:
     build_args = ["cmake", "--build", str(build_dir), "--target", "etch_tests"]
     if opts.preset == "windows":
         build_args += ["--config", "Debug"]
+
+    # Baseline gate: a suite that already fails would "catch" every mutant for the wrong reason.
+    status, failing = build_and_test(build_args, binary)
+    if status != "MISSED":
+        print(f"baseline is not green ({status} {', '.join(failing)}); fix that first")
+        return 2
+    print("baseline: all tests pass")
 
     results = []
     for file_name, description, edits in MUTATIONS:
@@ -195,29 +222,25 @@ def main() -> int:
             continue
         path.write_text(mutated, encoding="utf-8", newline="\n")
         try:
-            build = run(build_args)
-            if build.returncode != 0:
-                results.append(("BUILD FAILED", description, []))
-                print(f"BUILD FAILED {description}")
-                continue
-            test = run([str(binary)])
-            failing = [
-                line.split(maxsplit=1)[1] for line in test.stdout.splitlines() if line.startswith("  FAIL")
-            ]
-            status = "caught" if test.returncode != 0 else "MISSED"
+            status, failing = build_and_test(build_args, binary)
             results.append((status, description, failing))
             if failing:
                 detail = ", ".join(failing)
             elif status == "caught":
                 detail = "(the test binary crashed)"
-            else:
+            elif status == "MISSED":
                 detail = "(every test passed)"
+            else:
+                detail = ""
             print(f"{status:<12} {description}  {detail}")
         finally:
             path.write_text(original, encoding="utf-8", newline="\n")
 
-    # Leave the build matching the restored sources.
-    run(build_args)
+    # Leave the build matching the restored sources, and say so if that fails.
+    restored = run(build_args, BUILD_TIMEOUT_S)
+    if restored.returncode != 0:
+        print("WARNING: rebuilding the restored sources failed; run the build by hand")
+        return 2
     caught = sum(1 for r in results if r[0] == "caught")
     print(f"\n{caught} of {len(results)} injected bugs caught")
     return 0 if caught == len(results) else 1

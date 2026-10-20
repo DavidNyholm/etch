@@ -162,18 +162,47 @@ TEST(json_line_is_exact_for_a_fixed_record) {
   r.thread = std::this_thread::get_id();
   r.message = "say \"hi\"";
   std::string line;
-  etch::format_json(r, line);
+  etch::format_json(r, line);  // default JsonStyle: no path, no function name
+  const auto expected = std::format(
+      R"({{"ts":"2026-01-02T03:04:05.678Z","level":"info","logger":"unit","thread":"{}","pid":{},)"
+      R"("file":"{}","line":{},"msg":"say \"hi\""}})",
+      r.thread, etch::detail::process_id(), etch::detail::base_name(r.where.file_name()),
+      r.where.line());
+  CHECK_EQ(line, expected);
+  CHECK(json_valid(line));
+  CHECK(line.find("path") == std::string::npos);  // the absolute source path stays private
+}
+
+TEST(json_style_adds_path_and_function_and_can_drop_thread_pid_and_use_epoch_time) {
+  auto r = fixed_record();
+  r.message = "m";
+  etch::JsonStyle full;
+  full.path = true;
+  full.function = true;
+  std::string line;
+  etch::format_json(r, full, line);
   std::string path;
   etch::json_escape(r.where.file_name(), path);
   std::string func;
   etch::json_escape(r.where.function_name(), func);
-  const auto expected = std::format(
-      R"({{"ts":"2026-01-02T03:04:05.678Z","level":"info","logger":"unit","thread":"{}","pid":{},)"
-      R"("file":"{}","line":{},"path":"{}","func":"{}","msg":"say \"hi\""}})",
-      r.thread, etch::detail::process_id(), etch::detail::base_name(r.where.file_name()),
-      r.where.line(), path, func);
-  CHECK_EQ(line, expected);
+  CHECK(line.find(std::format(R"("path":"{}","func":"{}")", path, func)) != std::string::npos);
   CHECK(json_valid(line));
+
+  etch::JsonStyle compact;
+  compact.thread = false;
+  compact.pid = false;
+  compact.time = etch::JsonStyle::Time::kEpochMillis;
+  std::string small;
+  etch::format_json(r, compact, small);
+  const auto expected = std::format(
+      R"({{"ts":1767323045678,"level":"info","logger":"unit","file":"{}","line":{},"msg":"m"}})",
+      etch::detail::base_name(r.where.file_name()), r.where.line());
+  CHECK_EQ(small, expected);
+  CHECK(json_valid(small));
+  std::string default_line;
+  etch::format_json(r, default_line);
+  CHECK(small.size() < default_line.size());  // fewer characters than the default line
+  CHECK(small.size() * 2 < line.size());      // and less than half of the path+function line
 }
 
 TEST(json_value_renders_every_field_type) {
@@ -227,12 +256,15 @@ TEST(json_carries_hexdump_bytes_scope_duration_and_fatal_stack) {
   }
   CHECK(lines[0].find(R"("bytes":"01ab00ff")") != std::string::npos);
   CHECK_EQ(records[0].bytes.size(), 4u);
+  CHECK(lines[0].find(R"x("msg":"pkt (4 bytes)")x") != std::string::npos);  // label only
+  CHECK(lines[0].find("0000  01 ab") == std::string::npos);  // the dump text is not repeated
   CHECK(lines[1].find("duration_ns") == std::string::npos);  // begin has no duration
   CHECK(lines[2].find(R"("duration_ns":)") != std::string::npos);
   CHECK(records[2].duration.has_value());
 #if ETCH_HAS_STACKTRACE
   CHECK(!records[3].stack.empty());
   CHECK(lines[3].find(R"("stack":[")") != std::string::npos);
+  CHECK(lines[3].find(R"("msg":"boom")") != std::string::npos);  // frames only in "stack"
 #endif
 }
 

@@ -72,6 +72,7 @@ if(ETCH_BUILD_TESTS)
   target_link_libraries(etch_tests PRIVATE etch::etch)
   etch_strict_warnings(etch_tests)
   add_test(NAME etch_tests COMMAND etch_tests)
+  set_tests_properties(etch_tests PROPERTIES TIMEOUT 120)
 
   # Same suite with trace, debug and info compiled out, to prove ETCH_MIN_LEVEL works.
   add_executable(etch_tests_minlevel ${ETCH_TEST_SOURCES})
@@ -79,6 +80,7 @@ if(ETCH_BUILD_TESTS)
   target_compile_definitions(etch_tests_minlevel PRIVATE ETCH_MIN_LEVEL=3)
   etch_strict_warnings(etch_tests_minlevel)
   add_test(NAME etch_tests_minlevel COMMAND etch_tests_minlevel)
+  set_tests_properties(etch_tests_minlevel PROPERTIES TIMEOUT 120)
 endif()
 
 if(ETCH_BUILD_BENCH)

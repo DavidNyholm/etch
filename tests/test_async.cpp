@@ -219,7 +219,9 @@ TEST(async_flush_returns_while_another_thread_keeps_logging) {
   });
   // Only flush once the producer is demonstrably ahead of the worker, otherwise a flush that
   // waits for an idle queue would also return at once and prove nothing.
-  while (delivered.load() < 50 || async->queued() < 50) std::this_thread::yield();
+  while (!stop.load() && (delivered.load() < 50 || async->queued() < 50)) {
+    std::this_thread::yield();
+  }
   log.warn("before flush");
   const auto start = std::chrono::steady_clock::now();
   log.flush();
