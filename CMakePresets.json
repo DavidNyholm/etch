@@ -11,17 +11,26 @@
     },
     {
       "name": "linux",
-      "displayName": "GCC 14+ or Clang, Makefiles",
+      "displayName": "GCC 14+ or Clang, Makefiles, Debug",
       "generator": "Unix Makefiles",
       "binaryDir": "${sourceDir}/build/linux",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+    },
+    {
+      "name": "linux-release",
+      "displayName": "GCC 14+ or Clang, Makefiles, Release",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/linux-release",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" },
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
     }
   ],
   "buildPresets": [
     { "name": "windows", "configurePreset": "windows", "configuration": "Debug" },
     { "name": "windows-release", "configurePreset": "windows", "configuration": "Release" },
-    { "name": "linux", "configurePreset": "linux" }
+    { "name": "linux", "configurePreset": "linux" },
+    { "name": "linux-release", "configurePreset": "linux-release" }
   ],
   "testPresets": [
     {
@@ -30,6 +39,11 @@
       "configuration": "Debug",
       "output": { "outputOnFailure": true }
     },
-    { "name": "linux", "configurePreset": "linux", "output": { "outputOnFailure": true } }
+    { "name": "linux", "configurePreset": "linux", "output": { "outputOnFailure": true } },
+    {
+      "name": "linux-release",
+      "configurePreset": "linux-release",
+      "output": { "outputOnFailure": true }
+    }
   ]
 }

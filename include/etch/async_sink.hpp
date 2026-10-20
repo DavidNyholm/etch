@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <new>
 #include <stop_token>
 #include <thread>
 #include <utility>
@@ -124,9 +123,11 @@ class AsyncSink final : public Sink {
   const std::shared_ptr<Sink>& inner() const noexcept { return inner_; }
 
  private:
-  // Destructive interference size, so the hot counters do not share a cache line.
-#ifdef __cpp_lib_hardware_interference_size
-  static constexpr std::size_t kCacheLine = std::hardware_destructive_interference_size;
+  // Cache line size, so the hot counters below do not share a line. A fixed value rather than
+  // std::hardware_destructive_interference_size: GCC warns that the std constant changes with
+  // tuning flags (an ABI hazard for a header), and these are the real sizes anyway.
+#if defined(__aarch64__) || defined(_M_ARM64)
+  static constexpr std::size_t kCacheLine = 128;
 #else
   static constexpr std::size_t kCacheLine = 64;
 #endif

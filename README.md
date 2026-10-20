@@ -2,7 +2,7 @@
 
 A small, header-only C++23 logger. It uses the standard library plus three operating-system calls for console colour detection, and nothing else. It is a hobby project built to try the C++23 library in anger: `std::format` and `std::print`, `std::source_location`, `std::stacktrace`, `std::expected`, `std::jthread` with stop tokens, the C++20 time zone database, and a bounded ring queue with no locks on the producer path, written against the C++ memory model. There is a demo that shows every feature, a test suite under CTest, a benchmark, and a script that injects bugs to check the tests have teeth.
 
-**Status:** logger, sinks, async queue, demo, tests and benchmark are done and pass on Windows (MSVC 2026 Insiders). Linux is set up in CMake but untested until WSL is installed.
+**Status:** logger, sinks, async queue, demo, tests and benchmark are done and pass on Windows (MSVC 2026 Insiders) and on Linux (Ubuntu 24.04 under WSL 2, GCC 14.2), with zero warnings on both.
 
 ## Build and run
 
@@ -15,7 +15,7 @@ ctest --preset windows
 build\windows\Debug\etch_demo.exe
 ```
 
-On Linux use the `linux` preset in the same three commands and run `build/linux/etch_demo`. `--preset windows-release` builds optimised binaries into `build\windows\Release`, which is where `etch_bench.exe` is worth running.
+On Linux use the `linux` preset in the same three commands and run `build/linux/etch_demo`. The `windows-release` and `linux-release` presets build optimised binaries (into `build\windows\Release` and `build/linux-release`), which is where `etch_bench` is worth running.
 
 The demo prints one line per severity in colour, four loggers with their own name colours, formatted values, a hexdump, a scope timer, a filtered line, writes a rotating log file and an async burst from four threads, and ends with a fatal line carrying a stacktrace. `--no-colour` turns colour off, `--colour` forces it on when piping to a file, `--burst N` sets the lines per thread in the async section. The log files land in the current directory as `etch-demo.log`, `etch-demo.log.1`, `etch-demo.log.2` and `etch-demo.async.log`.
 
@@ -101,25 +101,28 @@ For an agent working on etch itself: `ctest --preset windows` is the oracle, `py
 
 ## Performance
 
-Measured with `etch_bench` on an AMD Ryzen 7 7800X3D, Windows 11, MSVC 2026 Insiders, Release build. These are the costs of one log call on the calling thread, averaged over 200,000 calls; run it yourself to get your own numbers.
+Measured with `etch_bench` on an AMD Ryzen 7 7800X3D, Release builds: Windows 11 with MSVC 2026 Insiders, and Ubuntu 24.04 with GCC 14.2 under WSL 2 (4 virtual CPUs). These are the costs of one log call on the calling thread, averaged over 200,000 calls; run it yourself to get your own numbers.
 
-| | per call |
-|---|---|
-| Format the message (`std::format`, two placeholders) | 118 ns |
-| Log to a sink that does nothing | 152 to 174 ns |
-| Log below the level | 1 ns |
-| Log to the memory sink | about 210 ns |
-| Log through the async sink into a file | about 180 to 210 ns (about 770 ns per line end to end, measured on the worker side) |
-| Four threads logging at once through the async sink | about 520 to 540 ns wall time per call per thread |
-| Four threads, 100,000 lines, 8.3 MB file (the demo) | about 60 ms end to end, nothing dropped |
+| per call | MSVC | GCC 14 |
+|---|---|---|
+| Format the message (`std::format`, two placeholders) | 118 ns | 67 ns |
+| Log to a sink that does nothing | 152 to 174 ns | 95 to 99 ns |
+| Log below the level | 1 ns | 0 ns |
+| Log to the memory sink | about 210 ns | about 113 ns |
+| Log through the async sink into a file | about 180 to 210 ns | about 120 ns |
+| Same, end to end per line including the worker's write | about 770 ns | about 370 ns |
+| Four threads logging at once through the async sink, wall time per call per thread | about 520 to 540 ns | about 390 to 510 ns |
+| Four threads, 100,000 lines, 8.3 MB file (the demo) | about 60 ms | about 41 ms |
+
+The gap between the columns is the standard library, not the compiler flags: libstdc++'s `std::format` is about half the cost of MSVC's.
 
 Before the two changes described above the full line took 15.8 µs to format and a synchronous file write 20 µs; the mutex-and-condition-variable queue cost the caller 400 to 600 ns alone and 1.7 µs under four-thread contention.
 
-Not measured: Linux, GCC, tail latency (the benchmark reports averages), or the console sink (it flushes every line on purpose, so it is bound by the terminal).
+Not measured: Clang or libc++, tail latency (the benchmark reports averages), or the console sink (it flushes every line on purpose, so it is bound by the terminal).
 
 ## How it is checked
 
-Forty-nine tests, written against a tiny harness in `tests/check.hpp` so the suite needs no framework. CTest runs the suite twice: once as built, and once with `ETCH_MIN_LEVEL=3` so the compile-time floor is exercised for real rather than assumed. Each run uses its own scratch directory, so the two can run in parallel.
+Forty-nine tests (forty-eight on Linux; the refused-rotation test relies on Windows file locking), written against a tiny harness in `tests/check.hpp` so the suite needs no framework. CTest runs the suite twice: once as built, and once with `ETCH_MIN_LEVEL=3` so the compile-time floor is exercised for real rather than assumed. Each run uses its own scratch directory, so the two can run in parallel. The same suite passes on MSVC and GCC 14, Debug and Release.
 
 - **Exact output.** The line layout, the hexdump (including the last partial line and the wide offsets past 64 KiB), every colour escape, the name palette, and the duration formatting are compared against exact strings.
 - **Source location.** The captured line equals the `__LINE__` of the call, and the file column is the base name.
@@ -167,6 +170,6 @@ All rights reserved. The source is public to read and evaluate, not to reuse. Se
 1. ~~Logger, sinks, async, demo, tests~~
 2. ~~Lock-free queue for the async sink, measured against the mutex one~~
 3. ~~Colour palette, per-logger name colours~~
-4. Build and test on Linux (WSL, GCC 14)
+4. ~~Build and test on Linux (WSL, GCC 14)~~
 5. Deferred formatting: queue the arguments instead of the formatted text, so the caller pays only a copy
 6. Structured output (JSON lines) as a sink option
