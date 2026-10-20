@@ -16,3 +16,4 @@ CMakeUserPresets.json
 AGENTS.md
 CLAUDE.md
 RESEARCH.md
+ruff.toml

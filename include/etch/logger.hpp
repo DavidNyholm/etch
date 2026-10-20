@@ -5,6 +5,7 @@
 #include <chrono>
 #include <concepts>
 #include <cstddef>
+#include <cstdlib>
 #include <format>
 #include <iterator>
 #include <memory>
@@ -95,7 +96,8 @@ inline std::string format_duration(std::chrono::nanoseconds d) {
 class Logger;
 
 // Logs "<what>: begin" when created and "<what>: done in <elapsed>" when it goes out of scope.
-// Returned by Logger::scope(); keep it in a named variable or it ends immediately.
+// Returned by Logger::scope(); keep it in a named variable or it ends immediately. It borrows
+// the logger, which must outlive it.
 class ScopeTimer {
  public:
   ScopeTimer(Logger& logger, Level level, std::string what, std::source_location where);
@@ -115,31 +117,42 @@ class ScopeTimer {
   std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
 };
 
+// Defined outside Logger so it can be a default argument of the constructor; GCC and Clang
+// reject a nested aggregate with default member initializers in that position.
+struct LoggerOptions {
+  bool stacktrace_on_fatal = true;  // append std::stacktrace to every fatal message
+};
+
 class Logger {
  public:
-  struct Options {
-    bool stacktrace_on_fatal = true;  // append std::stacktrace to every fatal message
-  };
+  using Options = LoggerOptions;
+  using SinkList = std::vector<std::shared_ptr<Sink>>;
 
-  explicit Logger(std::string name, std::vector<std::shared_ptr<Sink>> sinks = {},
-                  Options options = {})
-      : name_(std::move(name)), sinks_(std::move(sinks)), options_(options) {}
+  explicit Logger(std::string name, SinkList sinks = {}, Options options = Options{})
+      : name_(std::move(name)), sinks_(share(std::move(sinks))), options_(options) {}
 
   const std::string& name() const noexcept { return name_; }
 
-  // Sinks can be changed while other threads log; a shared mutex keeps that safe.
+  // The sink list is an immutable snapshot. A log call takes a shared lock only long enough to
+  // copy the snapshot's pointer, then calls the sinks with no logger lock held, so a sink (or
+  // its callback) may replace the list, and a replaced async sink joins its worker outside any
+  // lock. (A std::atomic<std::shared_ptr> would do the same job but measured 70 ns slower per
+  // call on MSVC than a shared lock.) Null entries are dropped.
   void add_sink(std::shared_ptr<Sink> sink) {
+    if (sink == nullptr) return;
+    std::shared_ptr<const SinkList> retired;  // destroyed after the lock is released
     std::unique_lock lock(sinks_mutex_);
-    sinks_.push_back(std::move(sink));
+    SinkList next = *sinks_;
+    next.push_back(std::move(sink));
+    retired = std::exchange(sinks_, share(std::move(next)));
   }
-  void set_sinks(std::vector<std::shared_ptr<Sink>> sinks) {
+  void set_sinks(SinkList sinks) {
+    auto next = share(std::move(sinks));
+    std::shared_ptr<const SinkList> retired;
     std::unique_lock lock(sinks_mutex_);
-    sinks_ = std::move(sinks);
+    retired = std::exchange(sinks_, std::move(next));
   }
-  std::vector<std::shared_ptr<Sink>> sinks() const {
-    std::shared_lock lock(sinks_mutex_);
-    return sinks_;
-  }
+  SinkList sinks() const { return *snapshot(); }
 
   void set_level(Level level) noexcept { level_.store(level, std::memory_order_relaxed); }
   Level get_level() const noexcept { return level_.load(std::memory_order_relaxed); }
@@ -153,8 +166,9 @@ class Logger {
   template <Level L, class... Args>
   void log_at(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
     if constexpr (L >= kCompileTimeMinLevel) {
-      if (enabled(L))
+      if (enabled(L)) {
         emit(L, fmt.where, std::vformat(fmt.format.get(), std::make_format_args(args...)));
+      }
     }
   }
 
@@ -207,19 +221,22 @@ class Logger {
     hexdump(level, label, std::ranges::data(range), bytes, where);
   }
 
+  // Lvalue-only: the timer keeps a reference to this logger, so a temporary would dangle.
   [[nodiscard]] ScopeTimer scope(std::string_view what, Level level = Level::kDebug,
-                                 std::source_location where = std::source_location::current()) {
+                                 std::source_location where = std::source_location::current()) & {
     return ScopeTimer(*this, level, std::string(what), where);
   }
 
   void flush() {
-    std::shared_lock lock(sinks_mutex_);
-    for (const auto& sink : sinks_) sink->flush();
+    const auto sinks = snapshot();
+    for (const auto& sink : *sinks) sink->flush();
   }
 
   // The last step of every log call: stamp the message and deliver it. Public so that helpers
-  // (ScopeTimer, custom wrappers) can log a message they formatted themselves.
+  // (ScopeTimer, custom wrappers) can log a message they formatted themselves. Applies the
+  // logger's level like every other entry point.
   void emit(Level level, const std::source_location& where, std::string message) {
+    if (!enabled(level)) return;
     Record r{level,
              std::chrono::system_clock::now(),
              std::this_thread::get_id(),
@@ -227,16 +244,32 @@ class Logger {
              name_,
              std::move(message)};
     if (level == Level::kFatal && options_.stacktrace_on_fatal) append_stacktrace(r.message);
-    std::shared_lock lock(sinks_mutex_);
-    for (const auto& sink : sinks_) {
-      if (sink->accepts(level)) sink->write(r);
+    const auto sinks = snapshot();
+    // Every sink but the last gets a copy; the last takes the record itself, so the common
+    // single-sink setup never copies the message.
+    Sink* last = nullptr;
+    for (const auto& sink : *sinks) {
+      if (!sink->accepts(level)) continue;
+      if (last != nullptr) last->write(r);
+      last = sink.get();
     }
+    if (last != nullptr) last->write(std::move(r));
     if (level == Level::kFatal) {
-      for (const auto& sink : sinks_) sink->flush();
+      for (const auto& sink : *sinks) sink->flush();
     }
   }
 
  private:
+  static std::shared_ptr<const SinkList> share(SinkList sinks) {
+    std::erase(sinks, nullptr);
+    return std::make_shared<const SinkList>(std::move(sinks));
+  }
+
+  std::shared_ptr<const SinkList> snapshot() const {
+    std::shared_lock lock(sinks_mutex_);
+    return sinks_;
+  }
+
   static void append_stacktrace(std::string& message) {
 #if ETCH_HAS_STACKTRACE
     // Skip this function and emit(); the rest is the caller's chain. In optimised builds the
@@ -253,10 +286,10 @@ class Logger {
   }
 
   std::string name_;
-  std::vector<std::shared_ptr<Sink>> sinks_;
+  std::shared_ptr<const SinkList> sinks_;  // guarded by sinks_mutex_; the list itself never changes
+  mutable std::shared_mutex sinks_mutex_;
   Options options_;
   std::atomic<Level> level_{Level::kTrace};
-  mutable std::shared_mutex sinks_mutex_;
 };
 
 inline ScopeTimer::ScopeTimer(Logger& logger, Level level, std::string what,
@@ -266,16 +299,28 @@ inline ScopeTimer::ScopeTimer(Logger& logger, Level level, std::string what,
 }
 
 inline ScopeTimer::~ScopeTimer() {
-  if (logger_.enabled(level_)) {
+  if (!logger_.enabled(level_)) return;
+  try {
     logger_.emit(level_, where_, std::format("{}: done in {}", what_, format_duration(elapsed())));
+  } catch (...) {
+    // A destructor must not throw; a sink that does (a user callback) loses this one line.
   }
 }
 
 // A process-wide logger named "main" that writes to the console. Swap its sinks with
 // default_logger().set_sinks(...) to send it elsewhere.
+//
+// It is never destroyed, on purpose: objects with static storage may log from their
+// destructors, which can run after a function-local static logger would already be gone. Its
+// sinks are flushed by an atexit handler registered on first use (the console sink flushes
+// every line anyway).
 inline Logger& default_logger() {
-  static Logger instance{"main", {std::make_shared<ConsoleSink>()}};
-  return instance;
+  static Logger* const instance = [] {
+    auto* logger = new Logger{"main", {std::make_shared<ConsoleSink>()}};
+    std::atexit([] { default_logger().flush(); });
+    return logger;
+  }();
+  return *instance;
 }
 
 // Free functions on the default logger: etch::info("hello {}", name).

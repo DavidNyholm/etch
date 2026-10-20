@@ -2,6 +2,7 @@
 //
 //   etch_demo [--no-colour] [--file <path>] [--burst <lines per thread>]
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -34,7 +35,12 @@ DemoArgs parse_args(int argc, char** argv) {
     } else if (a == "--file" && i + 1 < argc) {
       args.file = argv[++i];
     } else if (a == "--burst" && i + 1 < argc) {
-      args.burst = std::atoi(argv[++i]);
+      const std::string_view text = argv[++i];
+      const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), args.burst);
+      if (ec != std::errc{} || end != text.data() + text.size() || args.burst < 0) {
+        std::println(stderr, "--burst needs a non-negative integer, got '{}'", text);
+        std::exit(2);
+      }
     } else {
       std::println(stderr,
                    "usage: etch_demo [--colour | --no-colour] [--file <path>] [--burst <n>]");
@@ -63,6 +69,11 @@ void section_levels(etch::Logger& log) {
   log.warn("warn: something odd, carrying on");
   log.error("error: an operation failed");
   std::println("   (fatal is shown last, it comes with a stacktrace)");
+  std::println("   each logger name gets its own stable colour:");
+  for (const char* name : {"net", "render", "audio", "physics"}) {
+    etch::Logger sub{name, log.sinks()};
+    sub.info("hello from the {} subsystem", name);
+  }
 }
 
 void section_formatting(etch::Logger& log) {

@@ -1,15 +1,20 @@
 // etch test suite. Built twice: as etch_tests (ETCH_MIN_LEVEL=0) and as etch_tests_minlevel
 // (ETCH_MIN_LEVEL=3), so the compile-time floor is exercised for real.
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <random>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <etch/etch.hpp>
@@ -29,10 +34,12 @@ struct Captured {
   std::vector<std::string> messages() const { return sink->messages(); }
 };
 
+// One directory per test process, so the two CTest binaries can run in parallel without
+// deleting each other's files. main() removes it at the end.
 std::filesystem::path scratch_dir() {
   static const auto dir = [] {
-    auto d = std::filesystem::temp_directory_path() / "etch-tests";
-    std::filesystem::remove_all(d);
+    auto d = std::filesystem::temp_directory_path() /
+             std::format("etch-tests-{:08x}", std::random_device{}());
     std::filesystem::create_directories(d);
     return d;
   }();
@@ -45,6 +52,9 @@ std::vector<std::string> read_lines(const std::filesystem::path& p) {
   for (std::string line; std::getline(in, line);) lines.push_back(line);
   return lines;
 }
+
+template <class L>
+concept ScopeCallable = requires(L logger) { std::forward<L>(logger).scope("x"); };
 
 constexpr std::string_view kEsc = "\x1b[";
 
@@ -225,7 +235,7 @@ TEST(colour_wraps_the_level_and_nothing_leaks_when_off) {
   const auto r = fixed_record();
   etch::LineStyle style{.utc = true, .thread = false, .colour = true};
   const auto coloured = etch::format_line(r, style);
-  CHECK(coloured.find("\x1b[32mINFO \x1b[0m") != std::string::npos);
+  CHECK(coloured.find("\x1b[92mINFO \x1b[0m") != std::string::npos);
   style.colour = false;
   CHECK(etch::format_line(r, style).find(kEsc) == std::string::npos);
 }
@@ -256,6 +266,38 @@ TEST(time_cache_tracks_the_second_and_the_zone_flag) {
   const auto local = render(base, false);
   CHECK_EQ(render(base, true), std::string("2026-03-29 23:59:59.999"));
   CHECK_EQ(render(base, false), local);
+}
+
+TEST(logger_name_gets_a_stable_palette_colour) {
+  const etch::Palette palette;
+  const auto net = palette.name_colour("net");
+  CHECK_EQ(net, palette.name_colour("net"));
+  CHECK(std::find(palette.names.begin(), palette.names.end(), net) != palette.names.end());
+  auto r = fixed_record();
+  const etch::LineStyle style{.time = false, .thread = false, .location = false, .colour = true};
+  const auto expected =
+      std::format("\x1b[92mINFO \x1b[0m {}[unit]\x1b[0m hello", palette.name_colour("unit"));
+  CHECK_EQ(etch::format_line(r, style), expected);
+}
+
+TEST(warn_and_error_messages_are_coloured_info_is_plain) {
+  auto r = fixed_record();
+  const etch::LineStyle style{
+      .time = false, .thread = false, .name = false, .location = false, .colour = true};
+  r.level = etch::Level::kWarn;
+  CHECK_EQ(etch::format_line(r, style), std::string("\x1b[93mWARN \x1b[0m \x1b[33mhello\x1b[0m"));
+  r.level = etch::Level::kError;
+  CHECK_EQ(etch::format_line(r, style), std::string("\x1b[91mERROR\x1b[0m \x1b[31mhello\x1b[0m"));
+  r.level = etch::Level::kInfo;
+  CHECK_EQ(etch::format_line(r, style), std::string("\x1b[92mINFO \x1b[0m hello"));
+}
+
+TEST(appending_format_line_matches_the_returning_one) {
+  const auto r = fixed_record();
+  const etch::LineStyle style{.utc = true, .colour = true};
+  std::string out = "prefix:";
+  etch::format_line(r, style, out);
+  CHECK_EQ(out, "prefix:" + etch::format_line(r, style));
 }
 
 TEST(local_time_differs_from_utc_only_by_the_zone_offset) {
@@ -371,7 +413,7 @@ TEST(file_sink_writes_one_line_per_record) {
   auto file = etch::FileSink::open(path, {.truncate = true});
   CHECK(file.has_value());
   if (!file) return;
-  (*file)->style() = etch::LineStyle{.time = false, .thread = false};
+  (*file)->set_style(etch::LineStyle{.time = false, .thread = false});
   etch::Logger log{"disk", {*file}};
   const int first_line = (log.warn("first"), __LINE__);
   const int second_line = (log.warn("second {}", 2), __LINE__);
@@ -383,6 +425,8 @@ TEST(file_sink_writes_one_line_per_record) {
   if (lines.size() != 2) return;
   const auto bytes_on_disk = lines[0].size() + lines[1].size() + 2;  // two newlines
   CHECK_EQ((*file)->bytes_written(), static_cast<std::uintmax_t>(bytes_on_disk));
+  CHECK_EQ(std::filesystem::file_size(path), (*file)->bytes_written());  // binary mode: no CRLF
+  CHECK_EQ((*file)->write_failures(), 0u);
 }
 
 TEST(file_sink_appends_by_default) {
@@ -425,7 +469,7 @@ TEST(file_sink_rotates_at_max_bytes_and_keeps_every_line) {
       path, {.max_bytes = kMaxBytes, .max_files = kMaxFiles, .truncate = true});
   CHECK(file.has_value());
   if (!file) return;
-  (*file)->style() = etch::LineStyle{.time = false, .thread = false, .location = false};
+  (*file)->set_style(etch::LineStyle{.time = false, .thread = false, .location = false});
   etch::Logger log{"r", {*file}};
   for (int i = 0; i < kLines; ++i) log.warn("line {:02}", i);
   log.flush();
@@ -455,7 +499,7 @@ TEST(file_sink_rotation_drops_the_oldest_beyond_max_files) {
   auto file = etch::FileSink::open(path, {.max_bytes = 60, .max_files = 2, .truncate = true});
   CHECK(file.has_value());
   if (!file) return;
-  (*file)->style() = etch::LineStyle{.time = false, .thread = false, .location = false};
+  (*file)->set_style(etch::LineStyle{.time = false, .thread = false, .location = false});
   etch::Logger log{"c", {*file}};
   for (int i = 0; i < 40; ++i) log.warn("{:02}", i);
   log.flush();
@@ -473,6 +517,112 @@ TEST(console_sink_can_force_colour_off_and_on) {
 }
 
 // ---- async --------------------------------------------------------------------------------
+
+TEST(file_sink_with_max_files_zero_restarts_the_file) {
+  const auto path = scratch_dir() / "restart.log";
+  auto file = etch::FileSink::open(path, {.max_bytes = 60, .max_files = 0, .truncate = true});
+  CHECK(file.has_value());
+  if (!file) return;
+  (*file)->set_style(etch::LineStyle{.time = false, .thread = false, .location = false});
+  etch::Logger log{"z", {*file}};
+  for (int i = 0; i < 40; ++i) log.warn("{:02}", i);
+  log.flush();
+  CHECK((*file)->rotations() > 0);
+  CHECK((*file)->bytes_written() <= 60u);
+  CHECK(!std::filesystem::exists(path.string() + ".0"));
+  CHECK(!std::filesystem::exists(path.string() + ".1"));
+  CHECK_EQ((*file)->write_failures(), 0u);
+}
+
+TEST(sinks_can_be_replaced_while_other_threads_log) {
+  constexpr int kThreads = 4;
+  constexpr int kPerThread = 2000;
+  auto always = std::make_shared<etch::MemorySink>(kThreads * kPerThread);
+  auto sometimes = std::make_shared<etch::MemorySink>(kThreads * kPerThread);
+  etch::Logger log{"swap", {always}};
+  std::atomic<bool> go{false};
+  {
+    std::vector<std::jthread> workers;
+    for (int t = 0; t < kThreads; ++t) {
+      workers.emplace_back([&] {
+        while (!go.load()) {
+        }
+        for (int i = 0; i < kPerThread; ++i) log.warn("{}", i);
+      });
+    }
+    go = true;
+    for (int i = 0; i < 200; ++i) {
+      log.set_sinks({always, sometimes});
+      log.add_sink(std::make_shared<etch::MemorySink>(1));
+      log.set_sinks({always});
+    }
+  }
+  CHECK_EQ(always->total(), static_cast<std::size_t>(kThreads * kPerThread));
+  CHECK(sometimes->total() <= always->total());
+  CHECK_EQ(log.sinks().size(), 1u);
+}
+
+TEST(a_sink_callback_may_change_the_logger_sinks) {
+  auto late = std::make_shared<etch::MemorySink>();
+  etch::Logger log{"re", {}};
+  bool added = false;
+  auto hook = std::make_shared<etch::CallbackSink>([&](const etch::Record&) {
+    if (!added) {
+      added = true;
+      log.add_sink(late);  // allowed: the logger holds no lock while calling sinks
+    }
+  });
+  log.add_sink(hook);
+  log.warn("first");   // triggers the add
+  log.warn("second");  // reaches both
+  CHECK_EQ(late->messages(), (std::vector<std::string>{"second"}));
+}
+
+TEST(null_sinks_are_ignored_and_scope_needs_an_lvalue_logger) {
+  etch::Logger log{"n", {nullptr, std::make_shared<etch::MemorySink>(), nullptr}};
+  CHECK_EQ(log.sinks().size(), 1u);
+  log.add_sink(nullptr);
+  CHECK_EQ(log.sinks().size(), 1u);
+  log.warn("does not crash");
+  static_assert(!ScopeCallable<etch::Logger&&>, "scope() on a temporary logger would dangle");
+  static_assert(ScopeCallable<etch::Logger&>);
+}
+
+TEST(emit_applies_the_logger_level) {
+  Captured c;
+  c.log.set_level(etch::Level::kError);
+  c.log.emit(etch::Level::kWarn, std::source_location::current(), "filtered");
+  c.log.emit(etch::Level::kError, std::source_location::current(), "kept");
+  CHECK_EQ(c.messages(), (std::vector<std::string>{"kept"}));
+}
+
+TEST(async_applies_the_inner_sinks_level) {
+  auto memory = std::make_shared<etch::MemorySink>();
+  memory->set_level(etch::Level::kError);
+  auto async = std::make_shared<etch::AsyncSink>(memory);
+  etch::Logger log{"lvl", {async}};
+  log.warn("w");
+  log.error("e");
+  async->flush();
+  CHECK_EQ(memory->messages(), (std::vector<std::string>{"e"}));
+  CHECK_EQ(async->queued(), 0u);
+}
+
+TEST(async_survives_an_inner_sink_that_throws) {
+  std::vector<std::string> delivered;
+  auto fragile = std::make_shared<etch::CallbackSink>([&](const etch::Record& r) {
+    if (r.message == "boom") throw std::runtime_error("sink failed");
+    delivered.push_back(r.message);
+  });
+  auto async = std::make_shared<etch::AsyncSink>(fragile);
+  etch::Logger log{"throw", {async}};
+  log.warn("a");
+  log.warn("boom");
+  log.warn("b");
+  async->flush();
+  CHECK_EQ(delivered, (std::vector<std::string>{"a", "b"}));
+  CHECK_EQ(async->write_failures(), 1u);
+}
 
 TEST(async_delivers_everything_and_keeps_per_thread_order) {
   constexpr int kThreads = 8;
@@ -563,10 +713,40 @@ TEST(async_block_policy_never_drops) {
   CHECK_EQ(delivered.load(), 200);
 }
 
+TEST(async_flush_returns_while_another_thread_keeps_logging) {
+  std::atomic<int> delivered{0};
+  auto async = std::make_shared<etch::AsyncSink>(slow_sink(delivered, 20us), 256);
+  etch::Logger log{"busy", {async}};
+  std::atomic<bool> stop{false};
+  std::atomic<bool> flushed{false};
+  std::jthread producer([&] {
+    while (!stop.load()) log.warn("noise");
+  });
+  // Watchdog: if flush waits for the producer to go idle, it would never return. Stop the
+  // producer after a while so the test fails on the timing check instead of hanging.
+  std::jthread watchdog([&] {
+    for (int i = 0; i < 300 && !flushed.load(); ++i) std::this_thread::sleep_for(10ms);
+    stop = true;
+  });
+  // Only flush once the producer is demonstrably ahead of the worker, otherwise a flush that
+  // waits for an idle queue would also return at once and prove nothing.
+  while (delivered.load() < 50 || async->queued() < 50) std::this_thread::yield();
+  log.warn("before flush");
+  const auto start = std::chrono::steady_clock::now();
+  log.flush();
+  const auto took = std::chrono::steady_clock::now() - start;
+  flushed = true;
+  stop = true;
+  CHECK(took < 2s);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   std::println("etch tests (ETCH_MIN_LEVEL={}), scratch files in {}", ETCH_MIN_LEVEL,
                scratch_dir().string());
-  return check::run(argc, argv);
+  const int result = check::run(argc, argv);
+  std::error_code ec;
+  std::filesystem::remove_all(scratch_dir(), ec);
+  return result;
 }

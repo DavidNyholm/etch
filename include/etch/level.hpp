@@ -56,6 +56,9 @@ constexpr std::optional<Level> parse_level(std::string_view text) noexcept {
   return std::nullopt;
 }
 
+// Must be the same value in every translation unit of a program (set it on the target that
+// links etch, or globally), because the inline constant and the templates below are defined
+// in terms of it; two values in one program violate the one-definition rule.
 #ifndef ETCH_MIN_LEVEL
 #define ETCH_MIN_LEVEL 0  // trace: nothing is compiled out by default
 #endif

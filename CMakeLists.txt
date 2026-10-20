@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 
 project(etch
-  VERSION 0.1.0
+  VERSION 0.2.0
   DESCRIPTION "A small header-only C++23 logger"
   LANGUAGES CXX)
 
@@ -13,11 +13,34 @@ target_include_directories(etch INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 target_compile_features(etch INTERFACE cxx_std_23)
-# libstdc++ keeps std::stacktrace in a separate library.
-target_link_libraries(etch INTERFACE $<$<CXX_COMPILER_ID:GNU>:stdc++exp>)
+
+# The async sink starts a std::jthread; on some platforms that needs an explicit link.
+find_package(Threads REQUIRED)
+target_link_libraries(etch INTERFACE Threads::Threads)
+
+# libstdc++ keeps std::stacktrace in a separate library (libstdc++exp). Detect by trying,
+# so Clang on libstdc++ gets it too and Clang on libc++ (no <stacktrace>) is left alone.
+if(NOT MSVC)
+  include(CheckCXXSourceCompiles)
+  set(_etch_stacktrace_probe "
+    #include <stacktrace>
+    int main() { return static_cast<int>(std::stacktrace::current().size()) >= 0 ? 0 : 1; }")
+  set(CMAKE_REQUIRED_FLAGS "-std=c++23")
+  check_cxx_source_compiles("${_etch_stacktrace_probe}" ETCH_STACKTRACE_LINKS_ALONE)
+  if(NOT ETCH_STACKTRACE_LINKS_ALONE)
+    set(CMAKE_REQUIRED_LIBRARIES stdc++exp)
+    check_cxx_source_compiles("${_etch_stacktrace_probe}" ETCH_STACKTRACE_NEEDS_STDCXXEXP)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if(ETCH_STACKTRACE_NEEDS_STDCXXEXP)
+      target_link_libraries(etch INTERFACE stdc++exp)
+    endif()
+  endif()
+  unset(CMAKE_REQUIRED_FLAGS)
+endif()
 
 option(ETCH_BUILD_EXAMPLES "Build the demo program" ${PROJECT_IS_TOP_LEVEL})
 option(ETCH_BUILD_TESTS "Build the tests and register them with CTest" ${PROJECT_IS_TOP_LEVEL})
+option(ETCH_BUILD_BENCH "Build the calling-thread cost benchmark" ${PROJECT_IS_TOP_LEVEL})
 
 # Strict warnings for our own executables only; never forced on consumers of the library.
 function(etch_strict_warnings target)
@@ -48,4 +71,10 @@ if(ETCH_BUILD_TESTS)
   target_compile_definitions(etch_tests_minlevel PRIVATE ETCH_MIN_LEVEL=3)
   etch_strict_warnings(etch_tests_minlevel)
   add_test(NAME etch_tests_minlevel COMMAND etch_tests_minlevel)
+endif()
+
+if(ETCH_BUILD_BENCH)
+  add_executable(etch_bench bench/bench.cpp)
+  target_link_libraries(etch_bench PRIVATE etch::etch)
+  etch_strict_warnings(etch_bench)
 endif()

@@ -1,0 +1,202 @@
+"""Tests against deliberate bugs.
+
+Injects one bug at a time into the headers, rebuilds the test binary, runs it, and reports
+whether the suite caught the bug. Every file is restored afterwards, whatever happens.
+
+    python tools/mutate.py            # uses the "windows" or "linux" preset for this host
+    python tools/mutate.py --preset linux
+
+Needs the configure step to have been run for that preset (cmake --preset <name>).
+"""
+
+from __future__ import annotations
+
+import argparse
+import platform
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+INCLUDE = ROOT / "include" / "etch"
+
+# (file, description, [(text to find, replacement), ...]). Each replacement must match once.
+MUTATIONS = [
+    (
+        "level.hpp",
+        "parser rejects full-length names",
+        [("text.size() > full.size()", "text.size() >= full.size()")],
+    ),
+    (
+        "record.hpp",
+        "time cache ignores the utc flag",
+        [("key != cache.key || utc != cache.utc", "key != cache.key")],
+    ),
+    (
+        "record.hpp",
+        "time cache never invalidates on a new second",
+        [("key != cache.key || utc != cache.utc", "utc != cache.utc")],
+    ),
+    (
+        "record.hpp",
+        "location column prints the full path",
+        [("detail::base_name(r.where.file_name())", "r.where.file_name()")],
+    ),
+    (
+        "record.hpp",
+        "warn message loses its colour",
+        [('"\\x1b[33m",    // warn: yellow', '"",    // warn: yellow')],
+    ),
+    (
+        "sinks.hpp",
+        "sink level filter off by one",
+        [("return level >= get_level();", "return level > get_level();")],
+    ),
+    (
+        "sinks.hpp",
+        "memory sink keeps one record too many",
+        [
+            (
+                "if (records_.size() > capacity_) records_.pop_front();",
+                "if (records_.size() > capacity_ + 1) records_.pop_front();",
+            )
+        ],
+    ),
+    (
+        "sinks.hpp",
+        "rotation deletes the live file instead of renaming it",
+        [("std::filesystem::rename(path_, numbered(1), ec);", "std::filesystem::remove(path_, ec);")],
+    ),
+    (
+        "sinks.hpp",
+        "file sink never rotates",
+        [
+            (
+                "if (options_.max_bytes > 0 && would_overflow) rotate();",
+                "if (false && would_overflow) rotate();",
+            )
+        ],
+    ),
+    (
+        "sinks.hpp",
+        "file sink opens in text mode (CRLF on Windows)",
+        [("std::ios::out | std::ios::binary |", "std::ios::out |")],
+    ),
+    (
+        "async_sink.hpp",
+        "dropped records are not counted",
+        [("dropped_.fetch_add(1, std::memory_order_relaxed);", ";")],
+    ),
+    (
+        "async_sink.hpp",
+        "async ignores the inner sink's level",
+        [("if (inner_->accepts(r.level)) enqueue(std::move(r));", "enqueue(std::move(r));")],
+    ),
+    (
+        "async_sink.hpp",
+        "an exception from the inner sink is not counted",
+        [
+            (
+                "write_failures_.fetch_add(1, std::memory_order_relaxed);\n        }\n      }\n      batch.clear();",
+                "}\n      }\n      batch.clear();",
+            )
+        ],
+    ),
+    (
+        "async_sink.hpp",
+        "flush waits for the queue to be idle instead of for its own records",
+        [
+            (
+                "return written_pos_.load(std::memory_order_acquire) >= target;",
+                "return empty() && written_pos_.load(std::memory_order_acquire) >= "
+                "dequeue_pos_.load(std::memory_order_acquire);",
+            )
+        ],
+    ),
+    (
+        "logger.hpp",
+        "logger level filter off by one",
+        [
+            (
+                "return level >= kCompileTimeMinLevel && level >= get_level();",
+                "return level >= kCompileTimeMinLevel && level > get_level();",
+            )
+        ],
+    ),
+    ("logger.hpp", "hexdump loses the gap after eight bytes", [("if (i == kGapAfter) out += ' ';", "")]),
+    (
+        "logger.hpp",
+        "scope timer begin message changed",
+        [('std::format("{}: begin", what_)', 'std::format("{}: start", what_)')],
+    ),
+    ("logger.hpp", "null sinks are kept in the list", [("std::erase(sinks, nullptr);", "")]),
+    (
+        "logger.hpp",
+        "emit skips the level check",
+        [("if (!enabled(level)) return;\n    Record r{", "Record r{")],
+    ),
+]
+
+
+def run(args: list[str], cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    default_preset = "windows" if platform.system() == "Windows" else "linux"
+    parser.add_argument("--preset", default=default_preset)
+    opts = parser.parse_args()
+    build_dir = ROOT / "build" / opts.preset
+    binary = build_dir / ("Debug/etch_tests.exe" if opts.preset == "windows" else "etch_tests")
+    build_args = ["cmake", "--build", str(build_dir), "--target", "etch_tests"]
+    if opts.preset == "windows":
+        build_args += ["--config", "Debug"]
+
+    results = []
+    for file_name, description, edits in MUTATIONS:
+        path = INCLUDE / file_name
+        original = path.read_text(encoding="utf-8")
+        mutated = original
+        applicable = True
+        for old, new in edits:
+            if mutated.count(old) != 1:
+                applicable = False
+                break
+            mutated = mutated.replace(old, new)
+        if not applicable:
+            results.append(("NOT APPLIED", description, []))
+            print(f"NOT APPLIED  {description}  (the text to mutate was not found exactly once)")
+            continue
+        path.write_text(mutated, encoding="utf-8", newline="\n")
+        try:
+            build = run(build_args)
+            if build.returncode != 0:
+                results.append(("BUILD FAILED", description, []))
+                print(f"BUILD FAILED {description}")
+                continue
+            test = run([str(binary)])
+            failing = [
+                line.split(maxsplit=1)[1] for line in test.stdout.splitlines() if line.startswith("  FAIL")
+            ]
+            status = "caught" if test.returncode != 0 else "MISSED"
+            results.append((status, description, failing))
+            if failing:
+                detail = ", ".join(failing)
+            elif status == "caught":
+                detail = "(the test binary crashed)"
+            else:
+                detail = "(every test passed)"
+            print(f"{status:<12} {description}  {detail}")
+        finally:
+            path.write_text(original, encoding="utf-8", newline="\n")
+
+    # Leave the build matching the restored sources.
+    run(build_args)
+    caught = sum(1 for r in results if r[0] == "caught")
+    print(f"\n{caught} of {len(results)} injected bugs caught")
+    return 0 if caught == len(results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

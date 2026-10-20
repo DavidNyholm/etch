@@ -1,6 +1,7 @@
 // etch - sinks: where records go. Console (colour), file (rotating), memory (for tests), callback.
 #pragma once
 
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -9,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <ios>
 #include <memory>
 #include <mutex>
 #include <print>
@@ -28,20 +30,28 @@
 namespace etch {
 
 // A sink receives finished records. Every sink is safe to share between loggers and threads:
-// each one serialises its own writes.
+// each one serialises its own writes with a mutex.
+//
+// Contract for anything a sink calls (a CallbackSink function, a custom sink's write): it must
+// not log through a logger that feeds the same sink. The sink's mutex is held during the call
+// and is not recursive, and the async worker cannot wait for itself, so the result is a deadlock.
 class Sink {
  public:
   virtual ~Sink() = default;
   virtual void write(const Record& r) = 0;
+  // A sink that keeps the record (the async queue) overrides this to take it without a copy.
+  // The default forwards to the const& overload, so most sinks only implement that one.
+  virtual void write(Record&& r) { write(static_cast<const Record&>(r)); }
   virtual void flush() {}
 
   // Records below this level are skipped by this sink (the logger has its own level too).
-  void set_level(Level level) noexcept { min_level_ = level; }
-  Level get_level() const noexcept { return min_level_; }
-  bool accepts(Level level) const noexcept { return level >= min_level_; }
+  // Atomic because it can be changed from any thread while others are logging.
+  void set_level(Level level) noexcept { min_level_.store(level, std::memory_order_relaxed); }
+  Level get_level() const noexcept { return min_level_.load(std::memory_order_relaxed); }
+  bool accepts(Level level) const noexcept { return level >= get_level(); }
 
  private:
-  Level min_level_ = Level::kTrace;
+  std::atomic<Level> min_level_{Level::kTrace};
 };
 
 namespace detail {
@@ -58,7 +68,8 @@ inline bool is_terminal(std::FILE* f) noexcept {
 // The three Win32 calls needed to switch the console to ANSI escape processing, declared by hand
 // so this header does not drag in <windows.h> (and its min/max macros) for every user. If
 // <windows.h> is already included its declarations are used; these match them exactly
-// (HANDLE = void*, DWORD = unsigned long, BOOL = int).
+// (HANDLE = void*, DWORD = unsigned long, BOOL = int). Only stdout and stderr are console
+// streams; any other FILE* gets no colour.
 #ifndef _WINDOWS_
 extern "C" {
 __declspec(dllimport) void* __stdcall GetStdHandle(unsigned long);
@@ -70,6 +81,7 @@ inline bool enable_ansi_colours(std::FILE* f) noexcept {
   constexpr unsigned long kStdOutputHandle = static_cast<unsigned long>(-11);
   constexpr unsigned long kStdErrorHandle = static_cast<unsigned long>(-12);
   constexpr unsigned long kEnableVirtualTerminalProcessing = 0x0004;
+  if (f != stdout && f != stderr) return false;
   void* handle = GetStdHandle(f == stderr ? kStdErrorHandle : kStdOutputHandle);
   unsigned long mode = 0;
   if (handle == nullptr || GetConsoleMode(handle, &mode) == 0) return false;
@@ -99,26 +111,43 @@ inline bool want_colour(std::FILE* f) noexcept {
 }  // namespace detail
 
 // Writes to stdout (or stderr). Colour is on automatically when the stream is a terminal and
-// NO_COLOR is not set; override with the ColourMode argument or style().colour. Flushes every
-// line so nothing is lost if the process dies.
+// NO_COLOR is not set; override with the ColourMode argument or set_style(). Flushes every line
+// so nothing is lost if the process dies.
 class ConsoleSink final : public Sink {
  public:
   enum class ColourMode { kAutomatic, kAlways, kNever };
 
   explicit ConsoleSink(std::FILE* stream = stdout, ColourMode mode = ColourMode::kAutomatic)
       : stream_(stream) {
-    style_.colour = mode == ColourMode::kAlways  ? true
-                    : mode == ColourMode::kNever ? false
-                                                 : detail::want_colour(stream);
+    switch (mode) {
+      case ColourMode::kAutomatic:
+        style_.colour = detail::want_colour(stream);
+        break;
+      case ColourMode::kAlways:
+        detail::enable_ansi_colours(stream);  // best effort: a pipe does not need it
+        style_.colour = true;
+        break;
+      case ColourMode::kNever:
+        style_.colour = false;
+        break;
+    }
   }
 
-  LineStyle& style() noexcept { return style_; }
-  const LineStyle& style() const noexcept { return style_; }
+  // Both go through the mutex, so the style can be changed while other threads are logging.
+  LineStyle style() const {
+    std::lock_guard lock(mutex_);
+    return style_;
+  }
+  void set_style(LineStyle style) {
+    std::lock_guard lock(mutex_);
+    style_ = std::move(style);
+  }
 
   void write(const Record& r) override {
-    const std::string line = format_line(r, style_);
     std::lock_guard lock(mutex_);
-    std::println(stream_, "{}", line);  // std::print writes UTF-8 correctly to a Windows console
+    line_.clear();
+    format_line(r, style_, line_);       // reuses one buffer: no allocation per line
+    std::println(stream_, "{}", line_);  // std::print writes UTF-8 correctly to a Windows console
     std::fflush(stream_);
   }
   void flush() override {
@@ -128,25 +157,34 @@ class ConsoleSink final : public Sink {
 
  private:
   std::FILE* stream_;
-  LineStyle style_;
-  std::mutex mutex_;
+  LineStyle style_;   // guarded by mutex_
+  std::string line_;  // guarded by mutex_
+  mutable std::mutex mutex_;
+};
+
+// Defined outside FileSink so it can be a default argument of FileSink::open; GCC and Clang
+// reject a nested aggregate with default member initializers in that position.
+struct FileSinkOptions {
+  std::uintmax_t max_bytes = 0;   // 0: never rotate
+  unsigned max_files = 3;         // rotated files to keep (.1 .. .N); 0: just restart the file
+  Level flush_on = Level::kWarn;  // flush immediately at this level and above
+  bool truncate = false;          // start empty instead of appending
 };
 
 // Appends lines to a file. Optional size-based rotation: when the file would exceed max_bytes
 // it is renamed to <name>.1 (older ones shift to .2, .3 ... up to max_files) and a fresh file
 // is started. Buffered; flushed on warn and above, on flush(), and when destroyed.
+//
+// I/O failures never throw out of a log call. They are counted in write_failures() and the sink
+// keeps trying, so a disk that fills up and is freed again resumes logging. A rotation that
+// cannot move the live file aside keeps appending to it instead of truncating it.
 class FileSink final : public Sink {
  public:
-  struct Options {
-    std::uintmax_t max_bytes = 0;   // 0: never rotate
-    unsigned max_files = 3;         // how many rotated files to keep (.1 .. .N)
-    Level flush_on = Level::kWarn;  // flush immediately at this level and above
-    bool truncate = false;          // start empty instead of appending
-  };
+  using Options = FileSinkOptions;
 
   // Returns the open sink, or the OS error (missing directory, no permission, ...).
   [[nodiscard]] static std::expected<std::shared_ptr<FileSink>, std::error_code> open(
-      const std::filesystem::path& path, Options options = {}) {
+      const std::filesystem::path& path, Options options = Options{}) {
     auto sink = std::shared_ptr<FileSink>(new FileSink(path, options));
     if (const auto ec = sink->reopen(options.truncate)) return std::unexpected(ec);
     return sink;
@@ -154,12 +192,19 @@ class FileSink final : public Sink {
 
   ~FileSink() override {
     std::lock_guard lock(mutex_);
-    out_.flush();
+    flush_locked();
   }
 
-  LineStyle& style() noexcept { return style_; }
+  LineStyle style() const {
+    std::lock_guard lock(mutex_);
+    return style_;
+  }
+  void set_style(LineStyle style) {
+    std::lock_guard lock(mutex_);
+    style_ = std::move(style);
+  }
   const std::filesystem::path& path() const noexcept { return path_; }
-  std::uintmax_t bytes_written() const {
+  std::uintmax_t bytes_written() const {  // size of the live file, including what it had on open
     std::lock_guard lock(mutex_);
     return size_;
   }
@@ -167,20 +212,32 @@ class FileSink final : public Sink {
     std::lock_guard lock(mutex_);
     return rotations_;
   }
+  // Writes, flushes and rotations that the filesystem refused. Zero means every line is on disk
+  // (as far as the C++ stream can tell; it says nothing about power loss).
+  std::size_t write_failures() const {
+    std::lock_guard lock(mutex_);
+    return write_failures_;
+  }
 
   void write(const Record& r) override {
-    std::string line = format_line(r, style_);
-    line += '\n';
     std::lock_guard lock(mutex_);
-    const bool would_overflow = size_ > 0 && size_ + line.size() > options_.max_bytes;
+    line_.clear();
+    format_line(r, style_, line_);  // reuses one buffer: no allocation per line
+    line_ += '\n';
+    const bool would_overflow = size_ > 0 && size_ + line_.size() > options_.max_bytes;
     if (options_.max_bytes > 0 && would_overflow) rotate();
-    out_.write(line.data(), static_cast<std::streamsize>(line.size()));
-    size_ += line.size();
-    if (r.level >= options_.flush_on) out_.flush();
+    out_.write(line_.data(), static_cast<std::streamsize>(line_.size()));
+    if (out_) {
+      size_ += line_.size();
+    } else {
+      ++write_failures_;
+      out_.clear();  // keep the stream usable: the next write may succeed
+    }
+    if (r.level >= options_.flush_on) flush_locked();
   }
   void flush() override {
     std::lock_guard lock(mutex_);
-    out_.flush();
+    flush_locked();
   }
 
  private:
@@ -189,19 +246,35 @@ class FileSink final : public Sink {
     style_.colour = false;
   }
 
+  void flush_locked() {
+    out_.flush();
+    if (!out_) {
+      ++write_failures_;
+      out_.clear();
+    }
+  }
+
+  // Binary mode on purpose: in text mode Windows turns every '\n' into "\r\n" behind the
+  // stream's back, and size_ would no longer be the size of the file.
   std::error_code reopen(bool truncate) {
     out_.close();
     out_.clear();
-    out_.open(path_, truncate ? std::ios::out | std::ios::trunc : std::ios::out | std::ios::app);
-    if (!out_.is_open()) return std::error_code(errno, std::generic_category());
+    const auto mode =
+        std::ios::out | std::ios::binary | (truncate ? std::ios::trunc : std::ios::app);
+    out_.open(path_, mode);
+    if (!out_.is_open()) {
+      // ofstream does not promise to set errno; fall back to a generic I/O error.
+      return std::error_code(errno != 0 ? errno : EIO, std::generic_category());
+    }
     std::error_code ec;
     const auto existing = std::filesystem::file_size(path_, ec);
     size_ = ec ? 0 : existing;
     return {};
   }
 
-  // Caller holds mutex_. Filesystem failures here are swallowed on purpose: a logger must not
-  // throw from inside a log call. The worst case is that we keep appending to the same file.
+  // Caller holds mutex_. Moves the live file to .1 (shifting older ones up) and starts a fresh
+  // one. If the live file cannot be moved it is reopened for appending, never truncated: a
+  // rotation that fails must not cost the lines it was meant to preserve.
   void rotate() {
     out_.close();
     std::error_code ec;
@@ -210,27 +283,31 @@ class FileSink final : public Sink {
       p += "." + std::to_string(n);
       return p;
     };
-    std::filesystem::remove(numbered(options_.max_files), ec);
-    for (unsigned n = options_.max_files; n > 1; --n) {
-      if (std::filesystem::exists(numbered(n - 1), ec)) {
-        std::filesystem::rename(numbered(n - 1), numbered(n), ec);
-      }
-    }
+    bool live_file_preserved = false;
     if (options_.max_files > 0) {
+      std::filesystem::remove(numbered(options_.max_files), ec);  // may not exist: fine
+      for (unsigned n = options_.max_files; n > 1; --n) {
+        if (!std::filesystem::exists(numbered(n - 1), ec)) continue;
+        std::filesystem::rename(numbered(n - 1), numbered(n), ec);
+        if (ec) ++write_failures_;  // that one history file is lost; the live file is not
+      }
       std::filesystem::rename(path_, numbered(1), ec);
-    } else {
-      std::filesystem::remove(path_, ec);
+      live_file_preserved = !ec;
+      if (!live_file_preserved) ++write_failures_;
     }
-    ++rotations_;
-    reopen(true);
+    const bool start_fresh = live_file_preserved || options_.max_files == 0;
+    if (start_fresh) ++rotations_;
+    if (reopen(/*truncate=*/start_fresh)) ++write_failures_;
   }
 
   std::filesystem::path path_;
   Options options_;
-  LineStyle style_;
+  LineStyle style_;  // guarded by mutex_
   std::ofstream out_;
+  std::string line_;  // guarded by mutex_
   std::uintmax_t size_ = 0;
   unsigned rotations_ = 0;
+  std::size_t write_failures_ = 0;
   mutable std::mutex mutex_;
 };
 
@@ -245,8 +322,8 @@ class MemorySink final : public Sink {
 
   void write(const Record& r) override {
     std::lock_guard lock(mutex_);
-    if (records_.size() == capacity_) records_.pop_front();
-    records_.push_back(r);
+    records_.push_back(r);  // append first: if the copy throws, nothing is lost
+    if (records_.size() > capacity_) records_.pop_front();
     ++total_;
   }
 
@@ -283,7 +360,8 @@ class MemorySink final : public Sink {
 };
 
 // Hands every record to a function. The quickest way to plug in something custom (a game's
-// on-screen console, a network sender, a test probe).
+// on-screen console, a network sender, a test probe). The function runs under this sink's
+// mutex; see the contract on Sink.
 class CallbackSink final : public Sink {
  public:
   using Callback = std::function<void(const Record&)>;
