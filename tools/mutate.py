@@ -254,6 +254,21 @@ MUTATIONS = [
             )
         ],
     ),
+    (
+        "agent.hpp",
+        "the summary does not record errors",
+        [("    if (r.level >= Level::kError) {", "    if (false) {")],
+    ),
+    (
+        "agent.hpp",
+        "the agent profile keeps the thread and pid fields",
+        [
+            (
+                "                                    .thread = false,",
+                "                                    .thread = true,",
+            )
+        ],
+    ),
 ]
 
 

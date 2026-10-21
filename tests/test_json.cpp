@@ -339,4 +339,18 @@ TEST(json_msg_keeps_user_newlines_but_not_the_dump_or_the_frames) {
 #endif
 }
 
+TEST(summary_json_is_valid_and_has_every_level) {
+  auto summary = std::make_shared<etch::SummarySink>();
+  etch::Logger log{"s", {summary}};
+  log.warn("one");
+  log.error("two \"quoted\"");
+  const auto json = summary->json();
+  CHECK(json_valid(json));
+  for (const auto name : {"trace", "debug", "info", "warn", "error", "fatal"}) {
+    CHECK(json.find(std::format("\"{}\":", name)) != std::string::npos);
+  }
+  CHECK(json.find(R"("first_error":{)") != std::string::npos);
+  CHECK(json.find(R"("msg":"two \"quoted\""})") != std::string::npos);
+}
+
 }  // namespace

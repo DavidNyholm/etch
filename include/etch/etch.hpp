@@ -9,6 +9,7 @@
 //   auto timer = log.scope("load level");                   // "load level: done in 12.3 ms"
 #pragma once
 
+#include "agent.hpp"
 #include "async_sink.hpp"
 #include "json.hpp"
 #include "level.hpp"

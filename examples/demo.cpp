@@ -198,6 +198,31 @@ void section_json(const DemoArgs& args) {
   std::println("   ... -> {}", std::filesystem::absolute(path).string());
 }
 
+void section_agent(const DemoArgs& args) {
+  heading("10. Agent profile and run summary: what a program reads instead of the console");
+  auto path = args.file;
+  path.replace_extension(".agent.jsonl");
+  auto agent = etch::open_agent_log(
+      path, {.file = {.truncate = true, .style = etch::agent_profile().style}});
+  if (!agent) {
+    std::println("   could not open {}: {}", path.string(), agent.error().message());
+    return;
+  }
+  auto summary = std::make_shared<etch::SummarySink>();
+  summary->watch(*agent);
+  etch::Logger log{"agent", {*agent, summary}};
+  etch::Logger net = log.child("net");
+  log.info("world loaded");
+  net.with({{"peer", "10.0.0.7"}, {"ms", 48}}).warn("slow handshake");
+  net.error("connection reset");
+  log.with({{"frame", 1442}}).info("tick");
+  (*agent)->flush();
+  std::ifstream in(path);
+  std::string line;
+  while (std::getline(in, line)) std::println("   {}", line);
+  std::println("   summary: {}", summary->json());
+}
+
 void section_fatal(etch::Logger& log) {
   heading("8. Fatal: highlighted, flushed, with a stacktrace (no abort, that is your call)");
   log.fatal("simulated fatal error, exit code would be {}", 3);
@@ -220,6 +245,7 @@ int main(int argc, char** argv) {
   section_file(args);
   section_async(args);
   section_json(args);
+  section_agent(args);
   section_fatal(log);
   return 0;
 }
