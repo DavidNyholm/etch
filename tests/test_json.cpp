@@ -159,14 +159,14 @@ TEST(json_time_is_iso8601_utc) {
 
 TEST(json_line_is_exact_for_a_fixed_record) {
   auto r = fixed_record();
-  r.thread = std::this_thread::get_id();
+  r.thread_index = 7;
   r.message = "say \"hi\"";
   std::string line;
   etch::format_json(r, line);  // default JsonStyle: no path, no function name
   const auto expected = std::format(
-      R"({{"ts":"2026-01-02T03:04:05.678Z","level":"info","logger":"unit","thread":"{}","pid":{},)"
+      R"({{"ts":"2026-01-02T03:04:05.678Z","level":"info","logger":"unit","thread":{},"pid":{},)"
       R"("file":"{}","line":{},"msg":"say \"hi\""}})",
-      r.thread, etch::detail::process_id(), etch::detail::base_name(r.where.file_name()),
+      r.thread_index, etch::detail::process_id(), etch::detail::base_name(r.where.file_name()),
       r.where.line());
   CHECK_EQ(line, expected);
   CHECK(json_valid(line));
@@ -292,8 +292,51 @@ TEST(file_sink_json_format_writes_one_valid_object_per_line) {
 TEST(console_sink_can_force_colour_off_and_on) {
   etch::ConsoleSink off(stdout, etch::ConsoleSink::ColourMode::kNever);
   etch::ConsoleSink on(stdout, etch::ConsoleSink::ColourMode::kAlways);
-  CHECK(!off.style().colour);
-  CHECK(on.style().colour);
+  CHECK(off.style().colour == false);
+  CHECK(on.style().colour == true);
+}
+
+TEST(json_replaces_invalid_utf8_and_keeps_valid_sequences) {
+  std::string out;
+  etch::json_escape(
+      "a\xff\xfe"
+      "b Z\xc3\xbc"
+      "rich \xe2\x98\x83",
+      out);
+  CHECK_EQ(out, std::string("a\\ufffd\\ufffdb Z\xc3\xbc"
+                            "rich \xe2\x98\x83"));
+  CHECK(json_valid("\"" + out + "\""));
+  out.clear();
+  etch::json_escape("\xed\xa0\x80", out);  // a UTF-16 surrogate encoded in UTF-8: not allowed
+  CHECK(out.find("ufffd") != std::string::npos);
+}
+
+TEST(json_msg_keeps_user_newlines_but_not_the_dump_or_the_frames) {
+  Captured c{"unit", {.stacktrace_on_fatal = true}};
+  const std::array<unsigned char, 4> data{1, 2, 3, 4};
+  c.log.hexdump(etch::Level::kWarn, "two\nlines", data);
+  c.log.fatal("why\nbecause");
+  const auto records = c.sink->records();
+  CHECK_EQ(records.size(), 2u);
+  if (records.size() < 2) return;
+  std::string dump;
+  etch::format_json(records[0], dump);
+  CHECK(dump.find(R"x("msg":"two\nlines (4 bytes)")x") != std::string::npos);
+  CHECK(dump.find("0000") == std::string::npos);
+  std::string fatal;
+  etch::format_json(records[1], fatal);
+  CHECK(fatal.find(R"("msg":"why\nbecause")") != std::string::npos);
+  CHECK(fatal.find("stacktrace:") == std::string::npos);
+  CHECK(json_valid(dump) && json_valid(fatal));
+#if ETCH_HAS_STACKTRACE
+  // Frames carry base names only unless JsonStyle.path asks for the full path.
+  const auto stack_at = fatal.find("\"stack\":[");
+  if (stack_at != std::string::npos) {
+    const auto stack = fatal.substr(stack_at);
+    CHECK(stack.find("\\\\") == std::string::npos);  // no escaped backslash: no Windows path
+    CHECK(stack.find("/home/") == std::string::npos);
+  }
+#endif
 }
 
 }  // namespace

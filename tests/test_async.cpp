@@ -147,11 +147,11 @@ TEST(async_delivers_everything_and_keeps_per_thread_order) {
 // sleep_for on Windows rounds up to the scheduler tick, which would make these tests slow.
 std::shared_ptr<etch::CallbackSink> slow_sink(std::atomic<int>& delivered,
                                               std::chrono::microseconds per_record) {
-  return std::make_shared<etch::CallbackSink>([&delivered, per_record](const etch::Record&) {
+  return std::make_shared<etch::CallbackSink>([&delivered, per_record](const etch::Record& r) {
     const auto until = std::chrono::steady_clock::now() + per_record;
     while (std::chrono::steady_clock::now() < until) {
     }
-    delivered.fetch_add(1);
+    if (r.logger_name != "etch") delivered.fetch_add(1);  // gap markers are not the caller's
   });
 }
 
@@ -160,8 +160,10 @@ TEST(async_drop_policy_counts_what_it_loses) {
   constexpr std::size_t kCapacity = 8;
   std::atomic<int> delivered{0};
   {
-    auto async = std::make_shared<etch::AsyncSink>(slow_sink(delivered, 500us), kCapacity,
-                                                   etch::AsyncSink::Overflow::kDrop);
+    // keep_from = kOff: everything may be dropped, including these warn lines.
+    auto async =
+        std::make_shared<etch::AsyncSink>(slow_sink(delivered, 500us), kCapacity,
+                                          etch::AsyncSink::Overflow::kDrop, etch::Level::kOff);
     etch::Logger log{"drop", {async}};
     for (int i = 0; i < kSent; ++i) log.warn("{}", i);
     async->flush();
@@ -229,6 +231,59 @@ TEST(async_flush_returns_while_another_thread_keeps_logging) {
   flushed = true;
   stop = true;
   CHECK(took < 2s);
+}
+
+TEST(async_drop_keeps_records_at_or_above_keep_from_and_marks_the_gap) {
+  std::vector<etch::Record> delivered;
+  std::mutex m;
+  auto slow = std::make_shared<etch::CallbackSink>([&](const etch::Record& r) {
+    const auto until = std::chrono::steady_clock::now() + 200us;
+    while (std::chrono::steady_clock::now() < until) {
+    }
+    std::lock_guard lock(m);
+    delivered.push_back(r);
+  });
+  {
+    auto async = std::make_shared<etch::AsyncSink>(slow, 8, etch::AsyncSink::Overflow::kDrop,
+                                                   etch::Level::kError);
+    etch::Logger log{"drop", {async}};
+    for (int i = 0; i < 300; ++i) log.warn("noise {}", i);
+    log.error("must survive");
+    for (int i = 0; i < 300; ++i) log.warn("noise {}", i);
+    async->flush();
+    CHECK(async->dropped() > 0);
+  }
+  std::lock_guard lock(m);
+  bool error_seen = false;
+  std::size_t markers = 0;
+  std::size_t marked_total = 0;
+  for (const auto& r : delivered) {
+    if (r.message == "must survive") error_seen = true;
+    if (r.logger_name == "etch") {
+      ++markers;
+      CHECK(r.level == etch::Level::kWarn);
+      CHECK(r.message.find("records dropped") != std::string::npos);
+      CHECK_EQ(r.fields.size(), 1u);
+      if (!r.fields.empty()) marked_total += std::get<std::int64_t>(r.fields[0].value);
+    }
+  }
+  CHECK(error_seen);
+  CHECK(markers > 0);
+  CHECK(marked_total > 0);
+}
+
+TEST(shutdown_drains_then_writes_straight_through) {
+  std::atomic<int> delivered{0};
+  auto async = std::make_shared<etch::AsyncSink>(slow_sink(delivered, 100us));
+  etch::Logger log{"shut", {async}};
+  for (int i = 0; i < 50; ++i) log.warn("{}", i);
+  etch::flush_all();
+  CHECK_EQ(delivered.load(), 50);
+  async->shutdown();
+  log.warn("after shutdown");
+  CHECK_EQ(delivered.load(), 51);  // synchronous now: already there when the call returns
+  async->shutdown();               // a second time is harmless
+  CHECK_EQ(async->queued(), 0u);
 }
 
 }  // namespace

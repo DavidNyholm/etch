@@ -27,7 +27,7 @@ TEST(callback_sink_receives_records) {
   etch::Logger log{"unit", {sink}};
   log.warn("one");
   log.error("two");
-  CHECK_EQ(seen, (std::vector<std::string>{"WARN :one", "ERROR:two"}));
+  CHECK_EQ(seen, (std::vector<std::string>{"WARN:one", "ERROR:two"}));
 }
 
 TEST(file_sink_writes_one_line_per_record) {
@@ -75,7 +75,10 @@ TEST(file_sink_appends_by_default) {
 }
 
 TEST(file_sink_reports_open_errors_with_expected) {
-  const auto path = scratch_dir() / "no-such-dir" / "x.log";
+  // A parent that is a file, not a directory: create_directories cannot help and open fails.
+  const auto blocker = scratch_dir() / "blocker";
+  std::ofstream(blocker) << "not a directory";
+  const auto path = blocker / "x.log";
   auto file = etch::FileSink::open(path);
   CHECK(!file.has_value());
   if (file) return;
@@ -149,6 +152,7 @@ TEST(file_sink_keeps_appending_when_rotation_cannot_move_the_file) {
   log.flush();
   blocker.close();
   CHECK((*file)->write_failures() > 0);
+  CHECK((*file)->write_failures() < 10);  // one attempt per max_bytes written, not per line
   CHECK_EQ((*file)->rotations(), 0u);
   const auto lines = read_lines(path);
   CHECK_EQ(lines.size(), 30u);  // nothing lost: the live file was appended to, not truncated
@@ -157,5 +161,29 @@ TEST(file_sink_keeps_appending_when_rotation_cannot_move_the_file) {
   }
 }
 #endif
+
+TEST(file_sink_refuses_a_second_sink_on_the_same_path) {
+  const auto path = scratch_dir() / "once.log";
+  auto first = etch::FileSink::open(path, {.truncate = true});
+  CHECK(first.has_value());
+  auto second = etch::FileSink::open(path);
+  CHECK(!second.has_value());
+  if (!second) CHECK(second.error() == std::errc::device_or_resource_busy);
+  // Dropping the sink drops its registration; an expected has no reset, so assign an error.
+  first = std::unexpected(std::make_error_code(std::errc::invalid_argument));
+  auto third = etch::FileSink::open(path);
+  CHECK(third.has_value());
+}
+
+TEST(file_sink_creates_missing_parent_directories) {
+  const auto path = scratch_dir() / "deep" / "er" / "x.log";
+  auto file = etch::FileSink::open(path, {.truncate = true});
+  CHECK(file.has_value());
+  if (!file) return;
+  etch::Logger log{"d", {*file}};
+  log.warn("made it");
+  log.flush();
+  CHECK_EQ(read_lines(path).size(), 1u);
+}
 
 }  // namespace

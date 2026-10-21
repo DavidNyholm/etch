@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 
 project(etch
-  VERSION 0.2.0
+  VERSION 0.3.0
   DESCRIPTION "A small header-only C++23 logger"
   LANGUAGES CXX)
 
@@ -13,6 +13,20 @@ target_include_directories(etch INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 target_compile_features(etch INTERFACE cxx_std_23)
+
+# MSVC's std::print writes UTF-8 to the console correctly only when the translation unit's
+# literal encoding is UTF-8, so consumers inherit /utf-8. ETCH_MSVC_UTF8=OFF opts out.
+option(ETCH_MSVC_UTF8 "Compile consumers of etch with /utf-8 on MSVC" ON)
+if(ETCH_MSVC_UTF8)
+  target_compile_options(etch INTERFACE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+endif()
+
+# The compile-time level floor must be one value for the whole program; setting it here puts
+# it on every target that links etch. 0 = trace (nothing compiled out) .. 5 = fatal.
+set(ETCH_MIN_LEVEL "" CACHE STRING "Compile out calls below this level (0..5) in every consumer")
+if(NOT ETCH_MIN_LEVEL STREQUAL "")
+  target_compile_definitions(etch INTERFACE ETCH_MIN_LEVEL=${ETCH_MIN_LEVEL})
+endif()
 
 # The async sink starts a std::jthread; on some platforms that needs an explicit link.
 find_package(Threads REQUIRED)
@@ -36,6 +50,28 @@ if(NOT MSVC)
     endif()
   endif()
   unset(CMAKE_REQUIRED_FLAGS)
+endif()
+
+option(ETCH_INSTALL "Generate install rules and an etchConfig.cmake for find_package" ${PROJECT_IS_TOP_LEVEL})
+if(ETCH_INSTALL)
+  include(GNUInstallDirs)
+  include(CMakePackageConfigHelpers)
+  install(DIRECTORY include/etch DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+  install(TARGETS etch EXPORT etchTargets)
+  install(EXPORT etchTargets NAMESPACE etch:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/etch)
+  write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/etchConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/etchConfig.cmake"
+    "include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+include(\"\${CMAKE_CURRENT_LIST_DIR}/etchTargets.cmake\")
+")
+  install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/etchConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/etchConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/etch)
 endif()
 
 option(ETCH_BUILD_EXAMPLES "Build the demo program" ${PROJECT_IS_TOP_LEVEL})

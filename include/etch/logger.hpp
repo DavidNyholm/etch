@@ -5,10 +5,14 @@
 #include <chrono>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <format>
+#include <initializer_list>
 #include <iterator>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <ranges>
 #include <shared_mutex>
 #include <source_location>
@@ -50,38 +54,52 @@ struct FormatWithLocation {
       : format(text), where(loc) {}
 };
 
+// Bytes shown by a hexdump unless the call says otherwise: 256 lines of text. The rest is
+// summarised as a count, and only this many bytes travel with the record.
+inline constexpr std::size_t kDefaultHexdumpLimit = 4096;
+
 // Lays out a byte range like a hex editor: offset, 16 hex bytes (gap after 8), ASCII column.
 //   label (20 bytes)
 //     0000  48 65 6c 6c 6f 2c 20 77  6f 72 6c 64 21 00 ff 10  |Hello, world!...|
 //     0010  de ad be ef                                       |....|
-inline std::string format_hexdump(std::string_view label, const void* data, std::size_t size) {
+// Returns the text and the length of its first line (the label part).
+inline std::string format_hexdump(std::string_view label, const void* data, std::size_t size,
+                                  std::size_t limit = kDefaultHexdumpLimit,
+                                  std::size_t* label_length = nullptr) {
   constexpr std::size_t kBytesPerLine = 16;
   constexpr std::size_t kGapAfter = 8;
   constexpr std::size_t kWideOffsetFrom = 0x10000;  // past 64 KiB, offsets need 8 digits
   constexpr unsigned char kFirstPrintable = 0x20;
   constexpr unsigned char kLastPrintable = 0x7e;
 
-  const auto* bytes = static_cast<const unsigned char*>(data);
   std::string out = std::format("{} ({} bytes)", label, size);
+  if (label_length != nullptr) *label_length = out.size();
+  if (data == nullptr && size > 0) {
+    out += "\n  (null pointer)";
+    return out;
+  }
+  const auto* bytes = static_cast<const unsigned char*>(data);
+  const std::size_t shown = std::min(size, limit);
   auto app = std::back_inserter(out);
-  const int offset_digits = size >= kWideOffsetFrom ? 8 : 4;
-  for (std::size_t offset = 0; offset < size; offset += kBytesPerLine) {
+  const int offset_digits = shown >= kWideOffsetFrom ? 8 : 4;
+  for (std::size_t offset = 0; offset < shown; offset += kBytesPerLine) {
     std::format_to(app, "\n  {:0{}x}  ", offset, offset_digits);
     for (std::size_t i = 0; i < kBytesPerLine; ++i) {
       if (i == kGapAfter) out += ' ';
-      if (offset + i < size) {
+      if (offset + i < shown) {
         std::format_to(app, "{:02x} ", bytes[offset + i]);
       } else {
         out += "   ";
       }
     }
     out += " |";
-    for (std::size_t i = 0; i < kBytesPerLine && offset + i < size; ++i) {
+    for (std::size_t i = 0; i < kBytesPerLine && offset + i < shown; ++i) {
       const unsigned char b = bytes[offset + i];
       out += (b >= kFirstPrintable && b <= kLastPrintable) ? static_cast<char>(b) : '.';
     }
     out += '|';
   }
+  if (shown < size) std::format_to(app, "\n  ... {} more bytes not shown", size - shown);
   return out;
 }
 
@@ -93,14 +111,59 @@ inline std::string format_duration(std::chrono::nanoseconds d) {
   return std::format("{:.3f} s", duration<double>(d).count());
 }
 
+namespace detail {
+
+// The directory etch's headers live in, from the compiler's point of view, so stack frames
+// inside etch can be recognised by their source file and left out of a fatal's stacktrace.
+inline std::string_view etch_include_dir() {
+  static const std::string dir = [] {
+    const std::string_view here = std::source_location::current().file_name();
+    const auto cut = here.find_last_of("/\\");
+    return std::string(cut == std::string_view::npos ? std::string_view{}
+                                                     : here.substr(0, cut + 1));
+  }();
+  return dir;
+}
+
+inline bool same_path_prefix(std::string_view path, std::string_view prefix) noexcept {
+  if (prefix.empty() || path.size() < prefix.size()) return false;
+  for (std::size_t i = 0; i < prefix.size(); ++i) {
+    char a = path[i];
+    char b = prefix[i];
+#if defined(_WIN32)
+    // Windows paths compare without case, and the debugger may spell the drive letter either way.
+    if (a >= 'A' && a <= 'Z') a = static_cast<char>(a + ('a' - 'A'));
+    if (b >= 'A' && b <= 'Z') b = static_cast<char>(b + ('a' - 'A'));
+    if (a == '/') a = '\\';
+    if (b == '/') b = '\\';
+#endif
+    if (a != b) return false;
+  }
+  return true;
+}
+
+class SinkSet;
+
+}  // namespace detail
+
 class Logger;
+
+// How a scope timer behaves. begin = false halves the volume for per-frame scopes; min_duration
+// keeps the end line only when the scope was slow ("only tell me about frames over 16 ms").
+struct ScopeOptions {
+  Level level = Level::kDebug;
+  bool begin = true;
+  std::chrono::nanoseconds min_duration{0};
+};
 
 // Logs "<what>: begin" when created and "<what>: done in <elapsed>" when it goes out of scope.
 // Returned by Logger::scope(); keep it in a named variable or it ends immediately. It borrows
-// the logger, which must outlive it.
+// the logger, which must outlive it. Whether it logs at all is decided once, when it starts, so
+// a level change in between cannot produce an end without a begin or the reverse.
 class ScopeTimer {
  public:
-  ScopeTimer(Logger& logger, Level level, std::string what, std::source_location where);
+  ScopeTimer(Logger& logger, ScopeOptions options, std::string what, std::source_location where,
+             Fields fields = {});
   ~ScopeTimer();
   ScopeTimer(const ScopeTimer&) = delete;
   ScopeTimer& operator=(const ScopeTimer&) = delete;
@@ -111,9 +174,11 @@ class ScopeTimer {
 
  private:
   Logger& logger_;
-  Level level_;
+  ScopeOptions options_;
   std::string what_;
   std::source_location where_;
+  Fields fields_;
+  bool active_;
   std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
 };
 
@@ -123,37 +188,85 @@ struct LoggerOptions {
   bool stacktrace_on_fatal = true;  // append std::stacktrace to every fatal message
 };
 
+using SinkList = std::vector<std::shared_ptr<Sink>>;
+
+namespace detail {
+
+// The sink list a logger and its children share. The list itself is an immutable snapshot: a
+// log call takes the shared lock only long enough to copy the snapshot's pointer, then calls
+// the sinks with no logger lock held, so a sink (or its callback) may replace the list, and a
+// replaced async sink joins its worker outside any lock. (A std::atomic<std::shared_ptr> would
+// do the same job but measured 70 ns slower per call on MSVC than a shared lock.)
+class SinkSet {
+ public:
+  explicit SinkSet(SinkList sinks) : list_(share(std::move(sinks))) {}
+
+  std::shared_ptr<const SinkList> snapshot() const {
+    std::shared_lock lock(mutex_);
+    return list_;
+  }
+  void set(SinkList sinks) {
+    auto next = share(std::move(sinks));
+    std::shared_ptr<const SinkList> retired;  // destroyed after the lock is released
+    std::unique_lock lock(mutex_);
+    retired = std::exchange(list_, std::move(next));
+  }
+  void add(std::shared_ptr<Sink> sink) {
+    if (sink == nullptr) return;
+    std::shared_ptr<const SinkList> retired;
+    std::unique_lock lock(mutex_);
+    SinkList next = *list_;
+    next.push_back(std::move(sink));
+    retired = std::exchange(list_, share(std::move(next)));
+  }
+
+ private:
+  static std::shared_ptr<const SinkList> share(SinkList sinks) {
+    std::erase(sinks, nullptr);  // a null sink is a programming error; dropping it beats a crash
+    return std::make_shared<const SinkList>(std::move(sinks));
+  }
+
+  mutable std::shared_mutex mutex_;
+  std::shared_ptr<const SinkList> list_;
+};
+
+}  // namespace detail
+
 class Logger {
  public:
   using Options = LoggerOptions;
-  using SinkList = std::vector<std::shared_ptr<Sink>>;
+  using SinkList = etch::SinkList;
   class Entry;
 
   explicit Logger(std::string name, SinkList sinks = {}, Options options = Options{})
-      : name_(std::move(name)), sinks_(share(std::move(sinks))), options_(options) {}
+      : name_(std::move(name)),
+        sinks_(std::make_shared<detail::SinkSet>(std::move(sinks))),
+        options_(options) {}
+
+  // Movable so children can be returned by value. Do not move a logger that has live scope
+  // timers or entries: they hold a reference to it.
+  Logger(Logger&& other) noexcept
+      : name_(std::move(other.name_)),
+        sinks_(std::move(other.sinks_)),
+        options_(other.options_),
+        level_(other.level_.load(std::memory_order_relaxed)) {}
+  Logger(const Logger&) = delete;
+  Logger& operator=(const Logger&) = delete;
+  Logger& operator=(Logger&&) = delete;
 
   const std::string& name() const noexcept { return name_; }
 
-  // The sink list is an immutable snapshot. A log call takes a shared lock only long enough to
-  // copy the snapshot's pointer, then calls the sinks with no logger lock held, so a sink (or
-  // its callback) may replace the list, and a replaced async sink joins its worker outside any
-  // lock. (A std::atomic<std::shared_ptr> would do the same job but measured 70 ns slower per
-  // call on MSVC than a shared lock.) Null entries are dropped.
-  void add_sink(std::shared_ptr<Sink> sink) {
-    if (sink == nullptr) return;
-    std::shared_ptr<const SinkList> retired;  // destroyed after the lock is released
-    std::unique_lock lock(sinks_mutex_);
-    SinkList next = *sinks_;
-    next.push_back(std::move(sink));
-    retired = std::exchange(sinks_, share(std::move(next)));
+  // A logger for a subsystem that shares this logger's sinks, now and after any change to them,
+  // and starts with this logger's level and options. etch::get(name) does the same for the
+  // default logger and keeps the result for the life of the process.
+  Logger child(std::string name) const {
+    return Logger(std::move(name), sinks_, get_level(), options_);
   }
-  void set_sinks(SinkList sinks) {
-    auto next = share(std::move(sinks));
-    std::shared_ptr<const SinkList> retired;
-    std::unique_lock lock(sinks_mutex_);
-    retired = std::exchange(sinks_, std::move(next));
-  }
-  SinkList sinks() const { return *snapshot(); }
+
+  // Null entries are dropped. Changes are seen by every logger sharing this sink list.
+  void add_sink(std::shared_ptr<Sink> sink) { sinks_->add(std::move(sink)); }
+  void set_sinks(SinkList sinks) { sinks_->set(std::move(sinks)); }
+  SinkList sinks() const { return *sinks_->snapshot(); }
 
   void set_level(Level level) noexcept { level_.store(level, std::memory_order_relaxed); }
   Level get_level() const noexcept { return level_.load(std::memory_order_relaxed); }
@@ -209,39 +322,43 @@ class Logger {
   }
 
   // Attaches structured fields to one log call: log.with({{"fps", 59.2}}).warn("slow frame").
-  // Text output appends them as key=value; JSON output gets them as a "fields" object.
+  // Text output appends them as key=value; JSON output gets them as a "fields" object. The
+  // entry is for use in that one expression: it only looks at the fields if the level passes,
+  // so a filtered call with fields costs nothing more than a filtered call without.
+  Entry with(std::initializer_list<Field> fields) &;
   Entry with(Fields fields) &;
 
   // Dumps raw memory. The pointer overload takes anything; the range overload takes any
   // contiguous container (std::vector, std::array, std::string, std::span, ...). The text is
-  // the hex editor view; the record also carries the bytes themselves for the JSON output.
+  // the hex editor view of the first `limit` bytes; the record also carries those bytes
+  // themselves for the JSON output.
   void hexdump(Level level, std::string_view label, const void* data, std::size_t size,
+               std::size_t limit = kDefaultHexdumpLimit,
                std::source_location where = std::source_location::current()) {
     if (!enabled(level)) return;
-    Record r;
-    r.level = level;
-    r.where = where;
-    r.message = format_hexdump(label, data, size);
-    const auto* first = static_cast<const std::byte*>(data);
-    r.bytes.assign(first, first + size);
-    emit(std::move(r));
+    emit(hexdump_record(level, label, data, size, limit, where));
   }
   template <std::ranges::contiguous_range R>
     requires std::ranges::sized_range<R>
   void hexdump(Level level, std::string_view label, const R& range,
+               std::size_t limit = kDefaultHexdumpLimit,
                std::source_location where = std::source_location::current()) {
     const std::size_t bytes = std::ranges::size(range) * sizeof(std::ranges::range_value_t<R>);
-    hexdump(level, label, std::ranges::data(range), bytes, where);
+    hexdump(level, label, std::ranges::data(range), bytes, limit, where);
   }
 
   // Lvalue-only: the timer keeps a reference to this logger, so a temporary would dangle.
+  [[nodiscard]] ScopeTimer scope(std::string_view what, ScopeOptions options,
+                                 std::source_location where = std::source_location::current()) & {
+    return ScopeTimer(*this, options, std::string(what), where);
+  }
   [[nodiscard]] ScopeTimer scope(std::string_view what, Level level = Level::kDebug,
                                  std::source_location where = std::source_location::current()) & {
-    return ScopeTimer(*this, level, std::string(what), where);
+    return ScopeTimer(*this, ScopeOptions{.level = level}, std::string(what), where);
   }
 
   void flush() {
-    const auto sinks = snapshot();
+    const auto sinks = sinks_->snapshot();
     for (const auto& sink : *sinks) sink->flush();
   }
 
@@ -260,13 +377,23 @@ class Logger {
   // Same, for a record that already carries extras (fields, bytes, a duration). Fills in the
   // time, thread and logger name.
   void emit(Record r) {
+    if (!enabled(r.level)) return;
+    deliver(std::move(r));
+  }
+
+ private:
+  friend class ScopeTimer;
+
+  // Stamps and delivers without the level check: for a scope timer's end line, whose level was
+  // checked when the scope began.
+  void deliver(Record r) {
     const Level level = r.level;
-    if (!enabled(level)) return;
     r.time = std::chrono::system_clock::now();
     r.thread = std::this_thread::get_id();
+    r.thread_index = detail::this_thread_index();
     r.logger_name = name_;
     if (level == Level::kFatal && options_.stacktrace_on_fatal) append_stacktrace(r);
-    const auto sinks = snapshot();
+    const auto sinks = sinks_->snapshot();
     // Every sink but the last gets a copy; the last takes the record itself, so the common
     // single-sink setup never copies the message.
     Sink* last = nullptr;
@@ -281,28 +408,46 @@ class Logger {
     }
   }
 
+ public:
+  static Record hexdump_record(Level level, std::string_view label, const void* data,
+                               std::size_t size, std::size_t limit, std::source_location where) {
+    Record r;
+    r.level = level;
+    r.where = where;
+    r.message = format_hexdump(label, data, size, limit, &r.message_user_length);
+    if (data != nullptr) {
+      const auto* first = static_cast<const std::byte*>(data);
+      r.bytes.assign(first, first + std::min(size, limit));
+    }
+    return r;
+  }
+
  private:
-  static std::shared_ptr<const SinkList> share(SinkList sinks) {
-    std::erase(sinks, nullptr);
-    return std::make_shared<const SinkList>(std::move(sinks));
-  }
+  Logger(std::string name, std::shared_ptr<detail::SinkSet> sinks, Level level, Options options)
+      : name_(std::move(name)), sinks_(std::move(sinks)), options_(options), level_(level) {}
 
-  std::shared_ptr<const SinkList> snapshot() const {
-    std::shared_lock lock(sinks_mutex_);
-    return sinks_;
-  }
-
-  // Appends the frames to the message for people and keeps them as a list for the JSON output.
+  // Appends the frames to the message for people and keeps them as data for the JSON output.
+  // Frames inside etch's own headers are left out, whatever the compiler inlined, by looking at
+  // each frame's source file rather than counting.
   static void append_stacktrace(Record& r) {
+    if (r.message_user_length == std::string::npos) r.message_user_length = r.message.size();
 #if ETCH_HAS_STACKTRACE
-    // Skip this function and emit(); the rest is the caller's chain. In optimised builds the
-    // compiler may inline either one, which only changes which frames appear, never the order.
-    constexpr std::size_t kOwnFrames = 2;
     r.message += "\n  stacktrace:";
-    for (const auto& entry : std::stacktrace::current(kOwnFrames)) {
-      r.stack.push_back(std::to_string(entry));
+    const std::string_view own = detail::etch_include_dir();
+    for (const auto& entry : std::stacktrace::current()) {
+      Frame frame{entry.description(), entry.source_file(),
+                  static_cast<std::uint32_t>(entry.source_line())};
+      if (detail::same_path_prefix(frame.file, own)) continue;
+      if (frame.description.empty() && frame.file.empty()) continue;  // nothing to show
       r.message += "\n    ";
-      r.message += r.stack.back();
+      r.message += frame.description;
+      if (!frame.file.empty()) {
+        r.message += " at ";
+        r.message += frame.file;
+        r.message += ':';
+        r.message += std::to_string(frame.line);
+      }
+      r.stack.push_back(std::move(frame));
     }
 #else
     r.message += "\n  stacktrace: not available on this standard library";
@@ -310,91 +455,151 @@ class Logger {
   }
 
   std::string name_;
-  std::shared_ptr<const SinkList> sinks_;  // guarded by sinks_mutex_; the list itself never changes
-  mutable std::shared_mutex sinks_mutex_;
+  std::shared_ptr<detail::SinkSet> sinks_;
   Options options_;
   std::atomic<Level> level_{Level::kTrace};
 };
 
-inline ScopeTimer::ScopeTimer(Logger& logger, Level level, std::string what,
-                              std::source_location where)
-    : logger_(logger), level_(level), what_(std::move(what)), where_(where) {
-  if (logger_.enabled(level_)) logger_.emit(level_, where_, std::format("{}: begin", what_));
+inline ScopeTimer::ScopeTimer(Logger& logger, ScopeOptions options, std::string what,
+                              std::source_location where, Fields fields)
+    : logger_(logger),
+      options_(options),
+      what_(std::move(what)),
+      where_(where),
+      fields_(std::move(fields)),
+      active_(logger.enabled(options.level)) {
+  if (active_ && options_.begin) {
+    Record r;
+    r.level = options_.level;
+    r.where = where_;
+    r.message = std::format("{}: begin", what_);
+    r.fields = fields_;
+    logger_.deliver(std::move(r));
+  }
 }
 
 inline ScopeTimer::~ScopeTimer() {
-  if (!logger_.enabled(level_)) return;
+  if (!active_) return;
   try {
     const auto took = elapsed();
+    if (took < options_.min_duration) return;
     Record r;
-    r.level = level_;
+    r.level = options_.level;
     r.where = where_;
     r.message = std::format("{}: done in {}", what_, format_duration(took));
+    r.fields = std::move(fields_);
     r.duration = took;
-    logger_.emit(std::move(r));
+    logger_.deliver(std::move(r));
   } catch (...) {
     // A destructor must not throw; a sink that does (a user callback) loses this one line.
   }
 }
 
-// The result of Logger::with(): the same six calls, with the fields attached to the record.
+// The result of Logger::with(): the same calls as the logger, with the fields attached to the
+// record. Every method is rvalue-qualified, so an entry is used once, in the expression that
+// made it: log.with({{"k", v}}).info("..."). (That is also what keeps it cheap: the fields are
+// a view of the braced list until the level check passes.)
 class Logger::Entry {
  public:
-  Entry(Logger& logger, Fields fields) : logger_(logger), fields_(std::move(fields)) {}
+  Entry(Logger& logger, std::initializer_list<Field> fields) : logger_(logger), view_(fields) {}
+  Entry(Logger& logger, Fields fields) : logger_(logger), owned_(std::move(fields)) {}
 
   template <Level L, class... Args>
-  void log_at(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
+  void log_at(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) && {
     if constexpr (L >= kCompileTimeMinLevel) {
       if (!logger_.enabled(L)) return;
       Record r;
       r.level = L;
       r.where = fmt.where;
       r.message = std::vformat(fmt.format.get(), std::make_format_args(args...));
-      r.fields = std::move(fields_);
+      r.fields = take();
       logger_.emit(std::move(r));
     }
   }
   template <class... Args>
-  void trace(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
-    log_at<Level::kTrace>(fmt, std::forward<Args>(args)...);
+  void log(Level level, FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) && {
+    if (!logger_.enabled(level)) return;
+    Record r;
+    r.level = level;
+    r.where = fmt.where;
+    r.message = std::vformat(fmt.format.get(), std::make_format_args(args...));
+    r.fields = take();
+    logger_.emit(std::move(r));
   }
   template <class... Args>
-  void debug(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
-    log_at<Level::kDebug>(fmt, std::forward<Args>(args)...);
+  void trace(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) && {
+    std::move(*this).template log_at<Level::kTrace>(fmt, std::forward<Args>(args)...);
   }
   template <class... Args>
-  void info(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
-    log_at<Level::kInfo>(fmt, std::forward<Args>(args)...);
+  void debug(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) && {
+    std::move(*this).template log_at<Level::kDebug>(fmt, std::forward<Args>(args)...);
   }
   template <class... Args>
-  void warn(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
-    log_at<Level::kWarn>(fmt, std::forward<Args>(args)...);
+  void info(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) && {
+    std::move(*this).template log_at<Level::kInfo>(fmt, std::forward<Args>(args)...);
   }
   template <class... Args>
-  void error(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
-    log_at<Level::kError>(fmt, std::forward<Args>(args)...);
+  void warn(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) && {
+    std::move(*this).template log_at<Level::kWarn>(fmt, std::forward<Args>(args)...);
   }
   template <class... Args>
-  void fatal(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
-    log_at<Level::kFatal>(fmt, std::forward<Args>(args)...);
+  void error(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) && {
+    std::move(*this).template log_at<Level::kError>(fmt, std::forward<Args>(args)...);
+  }
+  template <class... Args>
+  void fatal(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) && {
+    std::move(*this).template log_at<Level::kFatal>(fmt, std::forward<Args>(args)...);
+  }
+
+  void hexdump(Level level, std::string_view label, const void* data, std::size_t size,
+               std::size_t limit = kDefaultHexdumpLimit,
+               std::source_location where = std::source_location::current()) && {
+    if (!logger_.enabled(level)) return;
+    Record r = Logger::hexdump_record(level, label, data, size, limit, where);
+    r.fields = take();
+    logger_.emit(std::move(r));
+  }
+  template <std::ranges::contiguous_range R>
+    requires std::ranges::sized_range<R>
+  void hexdump(Level level, std::string_view label, const R& range,
+               std::size_t limit = kDefaultHexdumpLimit,
+               std::source_location where = std::source_location::current()) && {
+    const std::size_t bytes = std::ranges::size(range) * sizeof(std::ranges::range_value_t<R>);
+    std::move(*this).hexdump(level, label, std::ranges::data(range), bytes, limit, where);
+  }
+
+  // A scope timer whose begin and end lines carry the fields.
+  [[nodiscard]] ScopeTimer scope(std::string_view what, ScopeOptions options = ScopeOptions{},
+                                 std::source_location where = std::source_location::current()) && {
+    return ScopeTimer(logger_, options, std::string(what), where, take());
   }
 
  private:
+  Fields take() {
+    if (!owned_.empty() || view_.size() == 0) return std::move(owned_);
+    return Fields(view_.begin(), view_.end());
+  }
+
   Logger& logger_;
-  Fields fields_;
+  std::initializer_list<Field> view_;  // empty by default
+  Fields owned_;
 };
 
+inline Logger::Entry Logger::with(std::initializer_list<Field> fields) & {
+  return Entry(*this, fields);
+}
 inline Logger::Entry Logger::with(Fields fields) & { return Entry(*this, std::move(fields)); }
 
 // A process-wide logger named "main" that writes to the console. Swap its sinks with
-// default_logger().set_sinks(...) to send it elsewhere.
+// default_logger().set_sinks(...) to send it elsewhere; etch::get("name") makes named children
+// that share them.
 //
 // It is never destroyed, on purpose: objects with static storage may log from their
 // destructors, which can run after a function-local static logger would already be gone. An
 // atexit handler registered on first use flushes its sinks and marks the process as exiting,
 // after which file sinks flush every line, so even a destructor that runs later (one whose
-// object was constructed before the logger was first used) gets its lines out. An async sink
-// attached to it is never joined; its worker keeps writing until the process ends.
+// object was constructed before the logger was first used) gets its lines out. Async sinks are
+// drained and switched to synchronous writes by their own exit handler (see etch::shutdown).
 inline Logger& default_logger() {
   static Logger* const instance = [] {
     auto* logger = new Logger{"main", {std::make_shared<ConsoleSink>()}};
@@ -409,6 +614,25 @@ inline Logger& default_logger() {
     return logger;
   }();
   return *instance;
+}
+
+// A named logger that shares the default logger's sinks: etch::get("render").info(...). The
+// same name always gives the same logger, created on first use and never destroyed, so it can
+// be used from static destructors like the default logger.
+inline Logger& get(std::string_view name) {
+  struct Registry {
+    std::mutex mutex;
+    std::map<std::string, std::unique_ptr<Logger>, std::less<>> loggers;
+  };
+  static Registry* const registry = new Registry;
+  std::lock_guard lock(registry->mutex);
+  if (const auto it = registry->loggers.find(name); it != registry->loggers.end()) {
+    return *it->second;
+  }
+  auto logger = std::make_unique<Logger>(default_logger().child(std::string(name)));
+  Logger& ref = *logger;
+  registry->loggers.emplace(std::string(name), std::move(logger));
+  return ref;
 }
 
 // Free functions on the default logger: etch::info("hello {}", name).
@@ -435,6 +659,31 @@ void error(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args
 template <class... Args>
 void fatal(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
   default_logger().log_at<Level::kFatal>(fmt, std::forward<Args>(args)...);
+}
+template <class... Args>
+void log(Level level, FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
+  default_logger().log(level, fmt, std::forward<Args>(args)...);
+}
+inline Logger::Entry with(std::initializer_list<Field> fields) {
+  return default_logger().with(fields);
+}
+inline Logger::Entry with(Fields fields) { return default_logger().with(std::move(fields)); }
+inline void hexdump(Level level, std::string_view label, const void* data, std::size_t size,
+                    std::size_t limit = kDefaultHexdumpLimit,
+                    std::source_location where = std::source_location::current()) {
+  default_logger().hexdump(level, label, data, size, limit, where);
+}
+template <std::ranges::contiguous_range R>
+  requires std::ranges::sized_range<R>
+void hexdump(Level level, std::string_view label, const R& range,
+             std::size_t limit = kDefaultHexdumpLimit,
+             std::source_location where = std::source_location::current()) {
+  default_logger().hexdump(level, label, range, limit, where);
+}
+[[nodiscard]] inline ScopeTimer scope(
+    std::string_view what, Level level = Level::kDebug,
+    std::source_location where = std::source_location::current()) {
+  return default_logger().scope(what, level, where);
 }
 
 }  // namespace etch

@@ -10,7 +10,7 @@ using namespace std::chrono_literals;
 TEST(line_layout_is_exact) {
   const auto r = fixed_record();
   etch::LineStyle style{.utc = true, .thread = false};
-  const auto expected = std::format("2026-01-02 03:04:05.678 INFO  [unit] {}:{}: hello",
+  const auto expected = std::format("2026-01-02 03:04:05.678Z INFO  [unit] {}:{}: hello",
                                     etch::detail::base_name(r.where.file_name()), r.where.line());
   CHECK_EQ(etch::format_line(r, style), expected);
 
@@ -18,11 +18,11 @@ TEST(line_layout_is_exact) {
   CHECK_EQ(etch::format_line(r, bare), std::string("INFO  hello"));
 }
 
-TEST(thread_column_matches_std_format_of_the_id) {
+TEST(thread_column_is_the_small_thread_number) {
   auto r = fixed_record();
-  r.thread = std::this_thread::get_id();
+  r.thread_index = 42;
   const etch::LineStyle style{.time = false, .name = false, .location = false};
-  CHECK_EQ(etch::format_line(r, style), std::format("INFO  [{}] hello", r.thread));
+  CHECK_EQ(etch::format_line(r, style), std::format("INFO  [{}] hello", r.thread_index));
 }
 
 TEST(colour_wraps_the_level_and_nothing_leaks_when_off) {
@@ -52,13 +52,13 @@ TEST(time_cache_tracks_the_second_and_the_zone_flag) {
     return s;
   };
   // Same second, different milliseconds: the cached prefix is reused, the suffix is not.
-  CHECK_EQ(render(base, true), std::string("2026-03-29 23:59:59.999"));
-  CHECK_EQ(render(base - 998ms, true), std::string("2026-03-29 23:59:59.001"));
+  CHECK_EQ(render(base, true), std::string("2026-03-29 23:59:59.999Z"));
+  CHECK_EQ(render(base - 998ms, true), std::string("2026-03-29 23:59:59.001Z"));
   // Next millisecond rolls the second, minute, hour and day: the prefix must be recomputed.
-  CHECK_EQ(render(base + 1ms, true), std::string("2026-03-30 00:00:00.000"));
+  CHECK_EQ(render(base + 1ms, true), std::string("2026-03-30 00:00:00.000Z"));
   // Switching between UTC and local in the same second must not reuse the other's prefix.
   const auto local = render(base, false);
-  CHECK_EQ(render(base, true), std::string("2026-03-29 23:59:59.999"));
+  CHECK_EQ(render(base, true), std::string("2026-03-29 23:59:59.999Z"));
   CHECK_EQ(render(base, false), local);
 }
 
@@ -100,7 +100,7 @@ TEST(local_time_differs_from_utc_only_by_the_zone_offset) {
   std::string utc;
   etch::format_time(local, r.time, false);
   etch::format_time(utc, r.time, true);
-  CHECK_EQ(utc, std::string("2026-01-02 03:04:05.678"));
+  CHECK_EQ(utc, std::string("2026-01-02 03:04:05.678Z"));
 #if ETCH_HAS_TIME_ZONES
   // Independent expectation: the standard's own zoned formatting of the same instant.
   if (const auto* zone = etch::detail::cached_local_zone()) {
@@ -108,10 +108,10 @@ TEST(local_time_differs_from_utc_only_by_the_zone_offset) {
     const auto expected = std::format("{:%F %T}", zoned_time{zone, floor<milliseconds>(r.time)});
     CHECK_EQ(local, expected);
   } else {
-    CHECK_EQ(local, utc + "Z");
+    CHECK_EQ(local, utc);  // no tz database: local falls back to UTC, marked the same way
   }
 #else
-  CHECK_EQ(local, utc + "Z");
+  CHECK_EQ(local, utc);
 #endif
 }
 
@@ -134,7 +134,36 @@ TEST(two_timestamp_modes_on_one_thread_keep_their_own_cache) {
   etch::format_time(utc2, r.time, true);
   CHECK_EQ(local1, local2);
   CHECK_EQ(utc1, utc2);
-  CHECK_EQ(utc1, std::string("2026-01-02 03:04:05.678"));
+  CHECK_EQ(utc1, std::string("2026-01-02 03:04:05.678Z"));
+}
+
+TEST(message_newlines_continue_indented_and_controls_are_escaped) {
+  auto r = fixed_record();
+  r.message = "line1\nline2\x1b[2J\x01 tab\tok";
+  const etch::LineStyle bare{.time = false, .thread = false, .name = false, .location = false};
+  CHECK_EQ(etch::format_line(r, bare), std::string("INFO  line1\n  line2\\e[2J\\x01 tab\tok"));
+}
+
+TEST(utc_lines_end_with_z_and_the_date_can_be_dropped) {
+  const auto r = fixed_record();
+  const etch::LineStyle utc{.utc = true, .thread = false, .name = false, .location = false};
+  CHECK_EQ(etch::format_line(r, utc), std::string("2026-01-02 03:04:05.678Z INFO  hello"));
+  const etch::LineStyle short_time{
+      .date = false, .utc = true, .thread = false, .name = false, .location = false};
+  CHECK_EQ(etch::format_line(r, short_time), std::string("03:04:05.678Z INFO  hello"));
+}
+
+TEST(colour_unset_lets_the_sink_decide) {
+  etch::ConsoleSink on(stdout, etch::ConsoleSink::ColourMode::kAlways);
+  on.set_style(etch::LineStyle{.thread = false});  // colour not mentioned: stays on
+  CHECK(on.style().colour == true);
+  CHECK(on.style().thread == false);
+  on.set_style(etch::LineStyle{.colour = false});
+  CHECK(on.style().colour == false);
+  etch::ConsoleSink off(stdout, etch::ConsoleSink::ColourMode::kNever,
+                        etch::LineStyle{.name = false});
+  CHECK(off.style().colour == false);
+  CHECK(off.style().name == false);
 }
 
 }  // namespace

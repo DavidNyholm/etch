@@ -72,7 +72,7 @@ MUTATIONS = [
         "file sink never rotates",
         [
             (
-                "if (options_.max_bytes > 0 && would_overflow) rotate();",
+                "if (options_.max_bytes > 0 && would_overflow && size_ >= retry_rotation_at_) rotate();",
                 "if (false && would_overflow) rotate();",
             )
         ],
@@ -94,11 +94,11 @@ MUTATIONS = [
     ),
     (
         "async_sink.hpp",
-        "an exception from the inner sink is not counted",
+        "an exception from the inner sink escapes the worker",
         [
             (
-                "write_failures_.fetch_add(1, std::memory_order_relaxed);\n        }\n      }\n      batch.clear();",
-                "}\n      }\n      batch.clear();",
+                "for (auto& queued : batch) write_inner(std::move(queued));",
+                "for (auto& queued : batch) inner_->write(std::move(queued));",
             )
         ],
     ),
@@ -133,7 +133,7 @@ MUTATIONS = [
     (
         "json.hpp",
         "JSON message is not escaped",
-        [("json_string(detail::json_message(r), out);", "out += detail::json_message(r);")],
+        [("json_string(r.user_message(), out);", "out += r.user_message();")],
     ),
     (
         "json.hpp",
@@ -155,8 +155,93 @@ MUTATIONS = [
         "emit skips the level check",
         [
             (
-                "    if (!enabled(level)) return;\n    r.time = std::chrono::system_clock::now();",
-                "    r.time = std::chrono::system_clock::now();",
+                "    if (!enabled(r.level)) return;\n    deliver(std::move(r));",
+                "    deliver(std::move(r));",
+            )
+        ],
+    ),
+    (
+        "async_sink.hpp",
+        "drop policy drops errors as readily as trace",
+        [("policy_ == Overflow::kDrop && r.level < keep_from_", "policy_ == Overflow::kDrop")],
+    ),
+    (
+        "async_sink.hpp",
+        "no gap marker after dropped records",
+        [("if (dropped_now != dropped_reported_) write_gap_marker(dropped_now);", ";")],
+    ),
+    (
+        "async_sink.hpp",
+        "shutdown does not switch to writing through",
+        [
+            (
+                "    passthrough_.store(true, std::memory_order_release);\n    std::lock_guard lock(mutex_);",
+                "    std::lock_guard lock(mutex_);",
+            )
+        ],
+    ),
+    (
+        "logger.hpp",
+        "etch's own frames are not filtered from the stacktrace",
+        [("if (detail::same_path_prefix(frame.file, own)) continue;", "")],
+    ),
+    (
+        "logger.hpp",
+        "scope end line is filtered by a later level change",
+        [
+            (
+                "    logger_.deliver(std::move(r));\n  } catch (...) {",
+                "    logger_.emit(std::move(r));\n  } catch (...) {",
+            )
+        ],
+    ),
+    (
+        "logger.hpp",
+        "hexdump ignores its limit",
+        [("const std::size_t shown = std::min(size, limit);", "const std::size_t shown = size;")],
+    ),
+    (
+        "sinks.hpp",
+        "a refused rotation is retried on every line",
+        [(" && size_ >= retry_rotation_at_) rotate();", ") rotate();")],
+    ),
+    (
+        "sinks.hpp",
+        "a second FileSink on the same path is not refused",
+        [("if (!detail::open_paths().insert(key).second) {", "if (false) {")],
+    ),
+    (
+        "sinks.hpp",
+        "set_style turns console colour off",
+        [("    if (!style_.colour.has_value()) style_.colour = colour_;", "")],
+    ),
+    (
+        "record.hpp",
+        "a newline in a message starts a new line unindented",
+        [('      out += "\\n  ";', '      out += "\\n";')],
+    ),
+    (
+        "record.hpp",
+        "UTC lines lose their Z marker",
+        [("  if (cache.zulu_suffix) out += 'Z';", "")],
+    ),
+    (
+        "json.hpp",
+        "invalid UTF-8 passes into the JSON",
+        [
+            (
+                "      if (length == 0) {\n        detail::append_replacement_character(out);",
+                "      if (length == 0) {\n        out += static_cast<char>(c);",
+            )
+        ],
+    ),
+    (
+        "level.hpp",
+        "kOff still accepts fatal",
+        [
+            (
+                '  if (is_prefix_of("off") || is_prefix_of("none")) return Level::kOff;',
+                '  if (is_prefix_of("off") || is_prefix_of("none")) return Level::kFatal;',
             )
         ],
     ),

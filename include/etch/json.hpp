@@ -1,11 +1,12 @@
 // etch - JSON Lines output: one JSON object per record, for programs rather than people.
 //
 // A line looks like this with the default JsonStyle (one line in the file):
-//   {"ts":"2026-10-20T19:38:13.091Z","level":"info","logger":"demo","thread":"30392",
-//    "pid":4120,"file":"demo.cpp","line":84,"msg":"frame 1442 ..."}
-// followed, when present, by "fields":{...}, "duration_ns":N, "bytes":"48656c..." (the whole
-// payload behind a hexdump as lowercase hex) and "stack":[...] (one string per frame).
-// JsonStyle adds "path" and "func", drops "thread" and "pid", or makes "ts" epoch milliseconds.
+//   {"ts":"2026-10-20T19:38:13.091Z","level":"info","logger":"demo","thread":1,"pid":4120,
+//    "file":"demo.cpp","line":84,"msg":"frame 1442 ..."}
+// followed, when present, by "fields":{...}, "duration_ns":N, "bytes":"48656c..." (the data
+// behind a hexdump as lowercase hex) and "stack":["frame (file.cpp:12)", ...]. JsonStyle adds
+// "path" and "func" (and full paths in frames), drops "thread" and "pid", or makes "ts" epoch
+// milliseconds. Text is UTF-8; an invalid byte sequence becomes U+FFFD, so every line decodes.
 #pragma once
 
 #include <cmath>
@@ -41,43 +42,77 @@ inline int process_id() noexcept {
 #endif
 }
 
-// The human text of a hexdump or a fatal has the payload rendered inside it (the dump lines,
-// the frames). The JSON line carries that payload as data, so the message keeps only its first
-// line and nothing is written twice.
-inline std::string_view json_message(const Record& r) noexcept {
-  if (r.bytes.empty() && r.stack.empty()) return r.message;
-  const std::string_view text = r.message;
-  return text.substr(0, text.find('\n'));
+// Length of the UTF-8 sequence starting at text[i] if it is well formed, else 0. Checks the
+// lead byte, the continuation bytes, overlong forms, surrogates and the U+10FFFF ceiling.
+inline std::size_t utf8_sequence_length(std::string_view text, std::size_t i) noexcept {
+  const auto byte = [&](std::size_t k) { return static_cast<unsigned char>(text[k]); };
+  const unsigned char lead = byte(i);
+  std::size_t length = 0;
+  unsigned char second_min = 0x80;
+  unsigned char second_max = 0xbf;
+  if (lead < 0x80) return 1;
+  if (lead >= 0xc2 && lead <= 0xdf) {
+    length = 2;
+  } else if (lead >= 0xe0 && lead <= 0xef) {
+    length = 3;
+    if (lead == 0xe0) second_min = 0xa0;  // no overlong three-byte forms
+    if (lead == 0xed) second_max = 0x9f;  // no UTF-16 surrogates
+  } else if (lead >= 0xf0 && lead <= 0xf4) {
+    length = 4;
+    if (lead == 0xf0) second_min = 0x90;  // no overlong four-byte forms
+    if (lead == 0xf4) second_max = 0x8f;  // nothing past U+10FFFF
+  } else {
+    return 0;
+  }
+  if (i + length > text.size()) return 0;
+  const unsigned char second = byte(i + 1);
+  if (second < second_min || second > second_max) return 0;
+  for (std::size_t k = 2; k < length; ++k) {
+    if ((byte(i + k) & 0xc0) != 0x80) return 0;
+  }
+  return length;
 }
 
-constexpr std::string_view json_level_name(Level level) noexcept {
-  switch (level) {
-    case Level::kTrace:
-      return "trace";
-    case Level::kDebug:
-      return "debug";
-    case Level::kInfo:
-      return "info";
-    case Level::kWarn:
-      return "warn";
-    case Level::kError:
-      return "error";
-    case Level::kFatal:
-      return "fatal";
-  }
-  return "unknown";
+inline void append_replacement_character(std::string& out) {
+  out += '\\';
+  out += "ufffd";
+}
+
+// A stack frame as one short string: "section_fatal (demo.cpp:176)", or just the description
+// for a frame without debug information.
+inline void frame_text(const Frame& f, bool full_path, std::string& out) {
+  out += f.description;
+  if (f.file.empty()) return;
+  out += " (";
+  out += full_path ? std::string_view(f.file) : base_name(f.file);
+  out += ':';
+  std::format_to(std::back_inserter(out), "{}", f.line);
+  out += ')';
 }
 
 }  // namespace detail
 
-// Appends the body of a JSON string (no surrounding quotes). Input is expected to be UTF-8 and
-// passes through untouched, invalid bytes included: the logger does not inspect text, so what
-// a caller logs is what the file holds. The quote, the backslash and every control character
-// are escaped, so the record stays one line whatever the message contains.
+// Appends the body of a JSON string (no surrounding quotes). The quote, the backslash and every
+// control character are escaped, so the record stays one line whatever the message contains.
+// Input is expected to be UTF-8; an invalid byte sequence is replaced by U+FFFD (written as
+// its six-character JSON escape), so a bad path or a binary blob logged as text cannot make
+// the file undecodable.
 inline void json_escape(std::string_view text, std::string& out) {
   constexpr unsigned char kLastControl = 0x1f;
-  constexpr std::string_view kHex = "0123456789abcdef";
-  for (const unsigned char c : text) {
+  for (std::size_t i = 0; i < text.size();) {
+    const unsigned char c = static_cast<unsigned char>(text[i]);
+    if (c >= 0x80) {
+      const std::size_t length = detail::utf8_sequence_length(text, i);
+      if (length == 0) {
+        detail::append_replacement_character(out);
+        ++i;
+      } else {
+        out.append(text.data() + i, length);
+        i += length;
+      }
+      continue;
+    }
+    ++i;
     switch (c) {
       case '"':
         out += "\\\"";
@@ -98,8 +133,8 @@ inline void json_escape(std::string_view text, std::string& out) {
         if (c <= kLastControl) {
           out += '\\';
           out += "u00";
-          out += kHex[c >> 4];
-          out += kHex[c & 0x0f];
+          out += detail::kHexDigits[c >> 4];
+          out += detail::kHexDigits[c & 0x0f];
         } else {
           out += static_cast<char>(c);
         }
@@ -142,9 +177,8 @@ inline void json_value(const FieldValue& value, std::string& out) {
 inline void format_time_iso8601(std::string& out, std::chrono::system_clock::time_point tp) {
   constexpr std::size_t kDateLength = 10;  // "2026-10-20"
   const std::size_t start = out.size();
-  format_time(out, tp, /*utc=*/true);
+  format_time(out, tp, /*utc=*/true);  // ends with "Z" already
   if (out.size() > start + kDateLength) out[start + kDateLength] = 'T';
-  out += 'Z';
 }
 
 // Appends one record as a single JSON object, no trailing newline.
@@ -161,13 +195,10 @@ inline void format_json(const Record& r, const JsonStyle& j, std::string& out) {
     out += '"';
   }
   out += ",\"level\":";
-  json_string(detail::json_level_name(r.level), out);
+  json_string(level_name(r.level), out);
   out += ",\"logger\":";
   json_string(r.logger_name, out);
-  if (j.thread) {
-    out += ",\"thread\":";
-    json_string(std::format("{}", r.thread), out);
-  }
+  if (j.thread) std::format_to(app, ",\"thread\":{}", r.thread_index);
   if (j.pid) std::format_to(app, ",\"pid\":{}", detail::process_id());
   out += ",\"file\":";
   json_string(detail::base_name(r.where.file_name()), out);
@@ -180,8 +211,9 @@ inline void format_json(const Record& r, const JsonStyle& j, std::string& out) {
     out += ",\"func\":";
     json_string(r.where.function_name(), out);
   }
+  // Only the caller's text: the dump lines and the frames travel as data below.
   out += ",\"msg\":";
-  json_string(detail::json_message(r), out);
+  json_string(r.user_message(), out);
   if (!r.fields.empty()) {
     out += ",\"fields\":{";
     bool first = true;
@@ -197,20 +229,22 @@ inline void format_json(const Record& r, const JsonStyle& j, std::string& out) {
   if (r.duration.has_value()) std::format_to(app, ",\"duration_ns\":{}", r.duration->count());
   if (!r.bytes.empty()) {
     out += ",\"bytes\":\"";
-    constexpr std::string_view kHex = "0123456789abcdef";
     for (const std::byte b : r.bytes) {
       const auto v = std::to_integer<unsigned>(b);
-      out += kHex[v >> 4];
-      out += kHex[v & 0x0f];
+      out += detail::kHexDigits[v >> 4];
+      out += detail::kHexDigits[v & 0x0f];
     }
     out += '"';
   }
   if (!r.stack.empty()) {
     out += ",\"stack\":[";
     bool first = true;
-    for (const auto& frame : r.stack) {
+    std::string frame;
+    for (const auto& f : r.stack) {
       if (!first) out += ',';
       first = false;
+      frame.clear();
+      detail::frame_text(f, j.path, frame);
       json_string(frame, out);
     }
     out += ']';

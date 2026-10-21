@@ -10,6 +10,14 @@
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
     },
     {
+      "name": "windows-ninja",
+      "displayName": "Ninja, the compiler on PATH (run from a VS developer prompt)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-ninja",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
       "name": "linux",
       "displayName": "GCC 14+ or Clang, Makefiles, Debug",
       "generator": "Unix Makefiles",
@@ -29,6 +37,7 @@
   "buildPresets": [
     { "name": "windows", "configurePreset": "windows", "configuration": "Debug" },
     { "name": "windows-release", "configurePreset": "windows", "configuration": "Release" },
+    { "name": "windows-ninja", "configurePreset": "windows-ninja" },
     { "name": "linux", "configurePreset": "linux" },
     { "name": "linux-release", "configurePreset": "linux-release" }
   ],
@@ -39,6 +48,13 @@
       "configuration": "Debug",
       "output": { "outputOnFailure": true }
     },
+    {
+      "name": "windows-release",
+      "configurePreset": "windows",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    },
+    { "name": "windows-ninja", "configurePreset": "windows-ninja", "output": { "outputOnFailure": true } },
     { "name": "linux", "configurePreset": "linux", "output": { "outputOnFailure": true } },
     {
       "name": "linux-release",

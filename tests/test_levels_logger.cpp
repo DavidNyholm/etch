@@ -10,7 +10,7 @@ using namespace std::chrono_literals;
 TEST(level_names_are_five_wide_and_round_trip) {
   for (auto l : {etch::Level::kTrace, etch::Level::kDebug, etch::Level::kInfo, etch::Level::kWarn,
                  etch::Level::kError, etch::Level::kFatal}) {
-    CHECK_EQ(etch::to_string(l).size(), 5u);
+    CHECK(etch::to_string(l).size() <= 5u);
     CHECK(etch::parse_level(etch::to_string(l)) == l);
   }
 }
@@ -23,12 +23,12 @@ TEST(parse_level_accepts_prefixes_and_case) {
   CHECK(!etch::parse_level("in").has_value());  // too short to be unambiguous
   CHECK(!etch::parse_level("nope").has_value());
   CHECK(!etch::parse_level("").has_value());
-  CHECK(!etch::parse_level("information").has_value());  // longer than the name
+  CHECK(etch::parse_level("information") == etch::Level::kInfo);
 }
 
 TEST(level_has_a_std_formatter) {
   CHECK_EQ(std::format("<{}>", etch::Level::kError), std::string("<ERROR>"));
-  CHECK_EQ(std::format("<{:>7}>", etch::Level::kInfo), std::string("<  INFO >"));
+  CHECK_EQ(std::format("<{:>7}>", etch::Level::kInfo), std::string("<   INFO>"));
 }
 
 // ---- logger -------------------------------------------------------------------------------
@@ -164,7 +164,7 @@ TEST(hexdump_layout_is_exact) {
 
 TEST(hexdump_uses_wide_offsets_and_keeps_columns_aligned) {
   const std::vector<unsigned char> big(0x10001, 0xaa);
-  const auto text = etch::format_hexdump("big", big.data(), big.size());
+  const auto text = etch::format_hexdump("big", big.data(), big.size(), big.size());
   CHECK(text.starts_with("big (65537 bytes)\n  00000000  aa aa"));
   CHECK(text.ends_with("|.|"));
   // The ASCII column must start at the same offset on a full line and on the 1-byte last line.
@@ -217,6 +217,179 @@ TEST(format_duration_picks_a_readable_unit) {
   CHECK_EQ(etch::format_duration(750us), std::string("750 us"));
   CHECK_EQ(etch::format_duration(12'345us), std::string("12.345 ms"));
   CHECK_EQ(etch::format_duration(2'500ms), std::string("2.500 s"));
+}
+
+TEST(level_off_accepts_nothing_and_parses) {
+  CHECK(etch::parse_level("off") == etch::Level::kOff);
+  CHECK(etch::parse_level("NONE") == etch::Level::kOff);
+  CHECK(etch::parse_level("critical") == etch::Level::kFatal);
+  CHECK(etch::parse_level("\tinfo\r\n") == etch::Level::kInfo);
+  auto sink = std::make_shared<etch::MemorySink>();
+  sink->set_level(etch::Level::kOff);
+  CHECK(!sink->accepts(etch::Level::kFatal));
+  etch::Logger log{"mute", {sink}};
+  log.fatal("silent");
+  CHECK_EQ(sink->size(), 0u);
+  Captured c;
+  c.log.set_level(etch::Level::kOff);
+  c.log.fatal("silent too");
+  CHECK_EQ(c.messages().size(), 0u);
+}
+
+enum class Colour : std::uint8_t { kRed = 1, kGreen = 2 };
+
+TEST(field_values_convert_common_types) {
+  const std::vector<int> v(3);
+  const std::string_view sv = "view";
+  const std::filesystem::path p = "dir/file.txt";
+  const etch::Fields fields{
+      {"size", v.size()},
+      {"big", std::numeric_limits<std::uint64_t>::max()},
+      {"view", sv},
+      {"colour", Colour::kGreen},
+      {"took", std::chrono::milliseconds(3)},
+      {"path", p},
+      {"letter", 'w'},
+      {"ratio", 0.5f},
+      {"negative", -7},
+  };
+  CHECK(std::get<std::int64_t>(fields[0].value) == 3);
+  CHECK_EQ(std::get<std::string>(fields[1].value), std::string("18446744073709551615"));
+  CHECK_EQ(std::get<std::string>(fields[2].value), std::string("view"));
+  CHECK(std::get<std::int64_t>(fields[3].value) == 2);
+  CHECK(std::get<std::int64_t>(fields[4].value) == 3'000'000);
+  CHECK_EQ(std::get<std::string>(fields[5].value), etch::utf8(p));
+  CHECK_EQ(std::get<std::string>(fields[6].value), std::string("w"));
+  CHECK(std::get<double>(fields[7].value) == 0.5);
+  CHECK(std::get<std::int64_t>(fields[8].value) == -7);
+}
+
+template <class E>
+concept LvalueEntryUsable = requires(E& e) { e.info("x"); };
+
+TEST(with_entry_is_single_use_and_carries_fields_everywhere) {
+  static_assert(!LvalueEntryUsable<etch::Logger::Entry>, "an entry is used once, as a temporary");
+  Captured c;
+  c.log.with({{"k", 1}}).log(etch::Level::kWarn, "runtime {}", "level");
+  const std::array<unsigned char, 2> data{1, 2};
+  c.log.with({{"k", 2}}).hexdump(etch::Level::kWarn, "dump", data);
+  {
+    auto timer = c.log.with({{"k", 3}}).scope("timed", {.level = etch::Level::kWarn});
+  }
+  const auto records = c.sink->records();
+  CHECK_EQ(records.size(), 4u);  // log, hexdump, scope begin, scope end
+  if (records.size() < 4) return;
+  for (const auto& r : records) CHECK_EQ(r.fields.size(), 1u);
+  CHECK_EQ(records[0].message, std::string("runtime level"));
+  CHECK_EQ(records[1].bytes.size(), 2u);
+  CHECK(records[3].duration.has_value());
+  // A filtered entry costs nothing and logs nothing.
+  c.log.set_level(etch::Level::kOff);
+  c.log.with({{"k", 4}}).warn("dropped");
+  CHECK_EQ(c.sink->total(), 4u);
+}
+
+TEST(child_loggers_share_sinks_and_the_registry_returns_one_object_per_name) {
+  auto first = std::make_shared<etch::MemorySink>();
+  etch::Logger parent{"app", {first}};
+  etch::Logger net = parent.child("net");
+  net.warn("hello");
+  auto second = std::make_shared<etch::MemorySink>();
+  parent.add_sink(second);  // after the child was made: the child must see it
+  net.warn("again");
+  CHECK_EQ(first->messages(), (std::vector<std::string>{"hello", "again"}));
+  CHECK_EQ(second->messages(), (std::vector<std::string>{"again"}));
+  CHECK_EQ(first->records().back().logger_name, std::string("net"));
+
+  etch::Logger& a = etch::get("registry-test");
+  etch::Logger& b = etch::get("registry-test");
+  CHECK(&a == &b);
+  CHECK_EQ(a.name(), std::string("registry-test"));
+  CHECK(a.sinks().size() == etch::default_logger().sinks().size());
+}
+
+TEST(scope_options_threshold_begin_flag_and_level_change) {
+  Captured c;
+  {
+    auto quiet = c.log.scope(
+        "fast",
+        {.level = etch::Level::kWarn, .begin = false, .min_duration = std::chrono::hours(1)});
+  }
+  CHECK_EQ(c.messages().size(), 0u);  // no begin, and too fast for an end
+  {
+    auto timer = c.log.scope("steady", etch::Level::kWarn);
+    c.log.set_level(etch::Level::kOff);  // the end must still appear: decided at the begin
+  }
+  c.log.set_level(etch::Level::kTrace);
+  const auto m = c.messages();
+  CHECK_EQ(m.size(), 2u);
+  if (m.size() == 2) CHECK(m[1].starts_with("steady: done in "));
+}
+
+TEST(hexdump_limit_caps_text_and_bytes_and_null_is_reported) {
+  Captured c;
+  const std::vector<unsigned char> big(10000, 0x5a);
+  c.log.hexdump(etch::Level::kWarn, "big", big);
+  c.log.hexdump(etch::Level::kWarn, "nothing", nullptr, 16);
+  const auto records = c.sink->records();
+  CHECK_EQ(records.size(), 2u);
+  if (records.size() < 2) return;
+  CHECK(records[0].message.ends_with("... 5904 more bytes not shown"));
+  CHECK_EQ(records[0].bytes.size(), etch::kDefaultHexdumpLimit);
+  CHECK_EQ(records[0].user_message(), std::string_view("big (10000 bytes)"));
+  CHECK(records[1].message.find("(null pointer)") != std::string::npos);
+  CHECK(records[1].bytes.empty());
+}
+
+TEST(fatal_keeps_the_whole_user_message_and_leaves_out_etch_frames) {
+  Captured c{"unit", {.stacktrace_on_fatal = true}};
+  c.log.fatal("first line\nsecond line");
+  const auto records = c.sink->records();
+  CHECK_EQ(records.size(), 1u);
+  if (records.empty()) return;
+  CHECK_EQ(records[0].user_message(), std::string_view("first line\nsecond line"));
+  CHECK(records[0].appended_text().starts_with("\n  stacktrace:"));
+  const std::string_view own = etch::detail::etch_include_dir();
+  for (const auto& frame : records[0].stack) {
+    CHECK(!etch::detail::same_path_prefix(frame.file, own));
+  }
+}
+
+TEST(thread_numbers_are_small_and_stable) {
+  Captured c;
+  c.log.warn("a");
+  c.log.warn("b");
+  std::jthread([&] { c.log.warn("c"); }).join();
+  const auto records = c.sink->records();
+  CHECK_EQ(records.size(), 3u);
+  if (records.size() < 3) return;
+  CHECK(records[0].thread_index > 0);
+  CHECK_EQ(records[0].thread_index, records[1].thread_index);
+  CHECK(records[2].thread_index != records[0].thread_index);
+}
+
+TEST(null_arguments_throw_at_construction) {
+  bool threw = false;
+  try {
+    etch::AsyncSink bad(nullptr);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  CHECK(threw);
+  threw = false;
+  try {
+    etch::ConsoleSink bad(nullptr);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  CHECK(threw);
+  threw = false;
+  try {
+    etch::CallbackSink bad(etch::CallbackSink::Callback{});
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  CHECK(threw);
 }
 
 }  // namespace
