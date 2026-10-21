@@ -471,4 +471,38 @@ TEST(hexdump_null_pointer_is_in_the_json_message) {
   CHECK(json.find("null pointer") != std::string::npos);
 }
 
+enum class Wide : std::uint64_t { kMax = std::numeric_limits<std::uint64_t>::max() };
+
+TEST(field_conversions_keep_wide_enums_and_exact_durations) {
+  const etch::Fields fields{
+      {"wide", Wide::kMax},
+      {"exact", std::chrono::nanoseconds(9007199254740993)},  // past double's integer range
+      {"float_ms", std::chrono::duration<double, std::milli>(1.5)},
+  };
+  CHECK_EQ(std::get<std::string>(fields[0].value), std::string("18446744073709551615"));
+  CHECK(std::get<std::int64_t>(fields[1].value) == 9007199254740993);
+  CHECK(std::get<std::int64_t>(fields[2].value) == 1'500'000);
+}
+
+void render_frame_for_the_trace(etch::Logger& log) { log.fatal("inside an app function"); }
+
+TEST(application_frames_that_mention_etch_types_are_kept) {
+  CHECK(etch::detail::is_etch_symbol("etch::Logger::emit(etch::Record)"));
+  CHECK(etch::detail::is_etch_symbol("etch_tests!etch::Logger::emit+0xD0"));
+  CHECK(!etch::detail::is_etch_symbol("render(etch::Logger&)"));
+  CHECK(!etch::detail::is_etch_symbol("app!render(etch::Logger&)+0x10"));
+  Captured c{"unit", {.stacktrace_on_fatal = true}};
+  render_frame_for_the_trace(c.log);
+  const auto records = c.sink->records();
+  CHECK_EQ(records.size(), 1u);
+  if (records.empty()) return;
+  bool symbols = false;
+  bool found = false;
+  for (const auto& frame : records[0].stack) {
+    if (!frame.file.empty()) symbols = true;
+    if (frame.description.find("render_frame_for_the_trace") != std::string::npos) found = true;
+  }
+  if (symbols) CHECK(found);  // only meaningful in a build with debug information
+}
+
 }  // namespace

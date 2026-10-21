@@ -40,11 +40,18 @@ namespace detail {
 // Every live AsyncSink, so flush_all() and shutdown() can reach them, and so an exit handler
 // can drain them: a std::exit() while an async sink still holds records would otherwise lose
 // them. The registry is never destroyed (a sink owned by a global may be destroyed after any
-// static would be), and its mutex is held for the whole of a traversal, so a sink cannot be
-// destroyed while flush_all() is talking to it: its destructor waits to unregister.
+// static would be). Each sink has an entry with its own lock: a traversal snapshots the entries
+// under the registry lock, releases it, then locks one entry at a time while it talks to that
+// sink. The sink's destructor takes its entry lock to clear the pointer, so it cannot be
+// destroyed mid-call, and nothing holds the registry lock while a worker is waited for, so a
+// callback that constructs or destroys another async sink does not deadlock.
+struct AsyncEntry {
+  std::mutex mutex;
+  AsyncSink* sink = nullptr;  // null once the sink is gone
+};
 struct AsyncRegistry {
   std::mutex mutex;
-  std::vector<AsyncSink*> live;
+  std::vector<std::shared_ptr<AsyncEntry>> live;
   bool exit_handler_installed = false;
 };
 inline AsyncRegistry& async_registry() {
@@ -117,9 +124,9 @@ inline void name_this_thread(const char* ascii_name) noexcept {
 //
 // Rules for sinks behind this one: whatever they call must not drop the last reference to this
 // AsyncSink (the destructor would then run on the worker thread and try to join itself), and
-// must not call flush_all() or shutdown() (they take the registry lock the destructor needs).
-// shutdown() called from the worker thread itself only closes the queue and asks the worker to
-// stop; it cannot wait for itself.
+// must not call this sink's flush() or shutdown(). shutdown() called from the worker thread
+// itself only closes the queue and asks the worker to stop; it cannot wait for itself, and
+// records arriving during that drain are not kept in order with the ring's contents.
 class AsyncSink final : public Sink {
  public:
   enum class Overflow { kBlock, kDrop };
@@ -150,6 +157,7 @@ class AsyncSink final : public Sink {
       slots_[i].sequence.store(i, std::memory_order_relaxed);
     }
     worker_ = std::jthread([this](std::stop_token st) { run(st); });
+    worker_id_ = worker_.get_id();  // read once here, never from the jthread during a join
     try {
       register_self();
     } catch (...) {
@@ -175,14 +183,17 @@ class AsyncSink final : public Sink {
     if (inner_->accepts(r.level)) enqueue(std::move(r));
   }
 
+  // Waits until everything enqueued before the call is written and every drop so far is
+  // reported, then flushes the inner sink. During a shutdown it waits for the worker to finish
+  // instead: closing admission is not delivery.
   void flush() override {
-    if (!closed_.load(std::memory_order_seq_cst)) {
-      const std::size_t target = enqueue_pos_.load(std::memory_order_seq_cst);
-      const std::size_t drops = dropped_.load(std::memory_order_seq_cst);
+    const std::size_t target = enqueue_pos_.load(std::memory_order_seq_cst);
+    const std::size_t drops = dropped_.load(std::memory_order_seq_cst);
+    {
       std::unique_lock lock(mutex_);
       if (drops != dropped_reported_.load(std::memory_order_acquire)) not_empty_.notify_one();
       drained_.wait(lock, [&] {
-        return closed_.load(std::memory_order_acquire) ||
+        return worker_finished_.load(std::memory_order_acquire) ||
                (written_pos_.load(std::memory_order_acquire) >= target &&
                 dropped_reported_.load(std::memory_order_acquire) >= drops);
       });
@@ -201,7 +212,7 @@ class AsyncSink final : public Sink {
       std::lock_guard lock(mutex_);
       not_full_.notify_all();  // blocked producers re-check closed_ and write through
     }
-    if (worker_.get_id() == std::this_thread::get_id()) {
+    if (worker_id_ == std::this_thread::get_id()) {
       worker_.request_stop();  // a callback on the worker: it cannot wait for itself
       return;
     }
@@ -252,9 +263,11 @@ class AsyncSink final : public Sink {
   };
 
   void register_self() {
+    entry_ = std::make_shared<detail::AsyncEntry>();
+    entry_->sink = this;
     auto& registry = detail::async_registry();
     std::lock_guard lock(registry.mutex);
-    registry.live.push_back(this);
+    registry.live.push_back(entry_);
     if (!registry.exit_handler_installed) {
       registry.exit_handler_installed = true;
       // On std::exit (or a return from main) every live async sink is drained and switched to
@@ -264,9 +277,29 @@ class AsyncSink final : public Sink {
     }
   }
   void unregister_self() noexcept {
+    if (entry_ == nullptr) return;
+    {
+      std::lock_guard lock(entry_->mutex);  // waits for a traversal that is using this sink
+      entry_->sink = nullptr;
+    }
     auto& registry = detail::async_registry();
     std::lock_guard lock(registry.mutex);
-    std::erase(registry.live, this);
+    std::erase(registry.live, entry_);
+  }
+
+  // Runs fn on every live sink, one entry lock at a time and never under the registry lock.
+  template <class Fn>
+  static void for_each_live(Fn&& fn) {
+    std::vector<std::shared_ptr<detail::AsyncEntry>> entries;
+    {
+      auto& registry = detail::async_registry();
+      std::lock_guard lock(registry.mutex);
+      entries = registry.live;
+    }
+    for (const auto& entry : entries) {
+      std::lock_guard lock(entry->mutex);
+      if (entry->sink != nullptr) fn(*entry->sink);
+    }
   }
 
   bool try_enqueue(Record& r) noexcept {
@@ -309,9 +342,12 @@ class AsyncSink final : public Sink {
     return enqueue_pos_.load(std::memory_order_seq_cst) ==
            dequeue_pos_.load(std::memory_order_seq_cst);
   }
+  // Sequentially consistent on purpose: a dropping producer increments dropped_ (seq_cst) and
+  // then reads worker_sleeping_; the worker writes worker_sleeping_ and then reads this. That
+  // is a Dekker pair, so neither side can miss the other and a gap is never left unreported.
   bool gap_unreported() const noexcept {
-    return dropped_.load(std::memory_order_acquire) !=
-           dropped_reported_.load(std::memory_order_acquire);
+    return dropped_.load(std::memory_order_seq_cst) !=
+           dropped_reported_.load(std::memory_order_seq_cst);
   }
 
   void wake_worker() {
@@ -388,10 +424,10 @@ class AsyncSink final : public Sink {
   // a reader of the file knows there is a gap here and how big it is. Worker only. Building the
   // marker allocates, so the whole thing is guarded: a failure is counted and the report still
   // advances, otherwise the worker would retry forever.
-  void report_gap() noexcept {
-    const std::size_t dropped_now = dropped_.load(std::memory_order_acquire);
+  bool report_gap() noexcept {
+    const std::size_t dropped_now = dropped_.load(std::memory_order_seq_cst);
     const std::size_t reported = dropped_reported_.load(std::memory_order_relaxed);
-    if (dropped_now == reported) return;
+    if (dropped_now == reported) return false;
     try {
       const std::size_t gap = dropped_now - reported;
       Record marker;
@@ -409,7 +445,8 @@ class AsyncSink final : public Sink {
     } catch (...) {
       write_failures_.fetch_add(1, std::memory_order_relaxed);
     }
-    dropped_reported_.store(dropped_now, std::memory_order_release);
+    dropped_reported_.store(dropped_now, std::memory_order_seq_cst);
+    return true;  // something was written (or tried): the inner sink wants a flush
   }
 
   void run(std::stop_token st) {
@@ -421,7 +458,7 @@ class AsyncSink final : public Sink {
     bool flushed_since_write = true;
     for (;;) {
       for (int i = 0; i < kYieldsBeforeSleep && empty(); ++i) std::this_thread::yield();
-      report_gap();
+      if (report_gap()) flushed_since_write = false;
       {
         std::unique_lock lock(mutex_);
         if (written_pos_.load(std::memory_order_relaxed) != batch_end) {
@@ -456,15 +493,16 @@ class AsyncSink final : public Sink {
         std::this_thread::yield();  // a producer claimed a slot but has not published it yet
         continue;
       }
-      report_gap();
+      if (report_gap()) flushed_since_write = false;
       for (auto& queued : batch) write_inner(std::move(queued));
       batch.clear();
       flushed_since_write = false;
     }
     // Exit handshake: announce, then keep draining until no producer is still inside and the
-    // ring is empty. (Producer: active +1, then read worker_gone_. Here: write worker_gone_,
-    // then read active. Both sequentially consistent, so a producer we stop waiting for is one
-    // that saw us gone and wrote through.)
+    // ring is empty. A producer that is inside either enqueues (its record is drained here, since
+    // it publishes before leaving active) or, blocked on a full ring, reads worker_gone_ after
+    // its own announcement and writes through. (Write worker_gone_ then read active here; a
+    // producer announces then reads worker_gone_: both sequentially consistent.)
     worker_gone_.store(true, std::memory_order_seq_cst);
     for (;;) {
       {
@@ -477,17 +515,18 @@ class AsyncSink final : public Sink {
       std::this_thread::yield();
     }
     report_gap();
+    flush_inner();  // the final drain's lines, and the last gap marker, reach their file
+    worker_finished_.store(true, std::memory_order_seq_cst);
     std::lock_guard lock(mutex_);
     not_full_.notify_all();  // late producers waiting for worker_gone_
+    drained_.notify_all();   // a flush() waiting on the worker during shutdown
   }
 
   // Shuts every live async sink down; the exit handler. The registry lock is held throughout,
   // so no sink can be destroyed under our feet.
   static void shutdown_all() noexcept {
     detail::process_exiting().store(true, std::memory_order_relaxed);
-    auto& registry = detail::async_registry();
-    std::lock_guard lock(registry.mutex);
-    for (AsyncSink* sink : registry.live) sink->shutdown();
+    for_each_live([](AsyncSink& sink) { sink.shutdown(); });
   }
 
   friend void flush_all();
@@ -501,8 +540,11 @@ class AsyncSink final : public Sink {
   alignas(kCacheLine) std::atomic<std::size_t> enqueue_pos_{0};
   alignas(kCacheLine) std::atomic<std::size_t> dequeue_pos_{0};
   alignas(kCacheLine) std::atomic<bool> worker_sleeping_{false};
-  std::atomic<bool> closed_{false};               // shutdown began: new records go straight through
-  std::atomic<bool> worker_gone_{false};          // the worker has left its loop
+  std::atomic<bool> closed_{false};            // shutdown began: new records wait, then go through
+  std::atomic<bool> worker_gone_{false};       // the worker has left its loop
+  std::atomic<bool> worker_finished_{false};   // ... and its final drain and flush are done
+  std::shared_ptr<detail::AsyncEntry> entry_;  // this sink's registry entry
+  std::thread::id worker_id_;                  // set once in the constructor
   std::atomic<std::size_t> active_producers_{0};  // producers between announcing and enqueueing
   std::atomic<std::size_t> written_pos_{0};       // everything before it is in the inner sink
   std::atomic<std::size_t> producers_waiting_{0};
@@ -527,9 +569,7 @@ class AsyncSink final : public Sink {
 // in normal context, a test's assertion, a hand-off to another process). Not from inside a
 // sink, and not from a signal handler: it locks, allocates and waits.
 inline void flush_all() {
-  auto& registry = detail::async_registry();
-  std::lock_guard lock(registry.mutex);
-  for (AsyncSink* sink : registry.live) sink->flush();
+  AsyncSink::for_each_live([](AsyncSink& sink) { sink.flush(); });
 }
 
 // Drains and stops every async worker and marks the process as exiting, after which every

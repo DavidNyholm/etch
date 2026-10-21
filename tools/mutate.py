@@ -191,7 +191,7 @@ MUTATIONS = [
         "etch's own frames are not filtered from the stacktrace",
         [
             ("      if (detail::same_path_prefix(frame.file, own)) continue;\n", ""),
-            ('      if (frame.description.find("etch::") != std::string::npos) continue;\n', ""),
+            ("      if (detail::is_etch_symbol(frame.description)) continue;\n", ""),
         ],
     ),
     (

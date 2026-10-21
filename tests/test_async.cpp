@@ -381,4 +381,30 @@ TEST(flush_all_while_async_sinks_come_and_go) {
   stop = true;
 }
 
+TEST(flush_during_shutdown_waits_for_the_worker_to_finish) {
+  std::atomic<int> delivered{0};
+  auto async = std::make_shared<etch::AsyncSink>(slow_sink(delivered, 500us));
+  etch::Logger log{"flush-shut", {async}};
+  for (int i = 0; i < 40; ++i) log.warn("{}", i);  // about 20 ms of work for the worker
+  std::jthread closer([&] { async->shutdown(); });
+  while (async->queued() > 30) std::this_thread::yield();  // shutdown is under way
+  async->flush();
+  CHECK_EQ(delivered.load(), 40);  // flush returned only once everything was written
+}
+
+TEST(flush_all_does_not_deadlock_when_a_callback_makes_another_async_sink) {
+  std::atomic<bool> made_one{false};
+  auto nested = std::make_shared<etch::CallbackSink>([&](const etch::Record&) {
+    if (made_one.exchange(true)) return;
+    auto inner = std::make_shared<etch::AsyncSink>(std::make_shared<etch::MemorySink>(4));
+    etch::Logger other{"nested", {inner}};
+    other.warn("from inside a worker callback");
+  });
+  auto async = std::make_shared<etch::AsyncSink>(nested);
+  etch::Logger log{"outer", {async}};
+  log.warn("trigger");
+  etch::flush_all();  // held a global lock across the worker before: this would deadlock
+  CHECK(made_one.load());
+}
+
 }  // namespace

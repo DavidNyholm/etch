@@ -122,6 +122,15 @@ constexpr std::string_view etch_include_dir() noexcept {
   return cut == std::string_view::npos ? std::string_view{} : here.substr(0, cut + 1);
 }
 
+// A frame whose symbol lives in namespace etch: "etch::Logger::emit(...)" (GCC) or
+// "app!etch::Logger::emit+0xD0" (MSVC, module-qualified). An application function that merely
+// takes an etch type, "render(etch::Logger&)", does not start that way and is kept.
+inline bool is_etch_symbol(std::string_view description) noexcept {
+  if (description.starts_with("etch::")) return true;
+  const auto bang = description.find('!');
+  return bang != std::string_view::npos && description.substr(bang + 1).starts_with("etch::");
+}
+
 inline bool same_path_prefix(std::string_view path, std::string_view prefix) noexcept {
   if (prefix.empty() || path.size() < prefix.size()) return false;
   for (std::size_t i = 0; i < prefix.size(); ++i) {
@@ -441,7 +450,7 @@ class Logger {
       // Two signals for "this frame is etch": its source file lives under etch's include
       // directory, or its symbol is in namespace etch (a build without source information).
       if (detail::same_path_prefix(frame.file, own)) continue;
-      if (frame.description.find("etch::") != std::string::npos) continue;
+      if (detail::is_etch_symbol(frame.description)) continue;
       if (frame.description.empty() && frame.file.empty()) continue;  // nothing to show
       r.message += "\n    ";
       r.message += frame.description;

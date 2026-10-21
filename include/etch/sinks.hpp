@@ -279,14 +279,17 @@ class FileSink final : public Sink {
         return std::unexpected(std::make_error_code(std::errc::device_or_resource_busy));
       }
     }
-    std::shared_ptr<FileSink> sink;
+    FileSink* raw = nullptr;
     try {
-      sink = std::shared_ptr<FileSink>(new FileSink(path, options, key));
+      raw = new FileSink(path, options, key);
     } catch (...) {
       std::lock_guard lock(detail::open_paths_mutex());
-      detail::open_paths().erase(key);  // the destructor that would have done it never runs
+      detail::open_paths().erase(key);  // no object, so no destructor to release it
       throw;
     }
+    // From here the object exists and its destructor releases the reservation, including when
+    // the shared_ptr below cannot be allocated (it deletes the object before throwing).
+    std::shared_ptr<FileSink> sink(raw);
     // From here the sink's destructor releases the reservation, including on the failure
     // return below (the shared_ptr goes out of scope).
     if (options.create_directories && path.has_parent_path()) {
