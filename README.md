@@ -155,6 +155,8 @@ Sixty tests (fifty-nine on Linux; the refused-rotation test relies on Windows fi
 python tools/mutate.py
 ```
 
+**Nothing private leaves the machine.** `tools/prepush.py` is a git pre-push hook (install it once per clone with `python tools/prepush.py --install`). It scans the commits about to be pushed, their messages and file names, and refuses the push on drive-letter paths, home directories, the current login name used as a path segment, e-mail addresses other than GitHub's noreply one, token-shaped strings (GitHub, OpenAI, AWS, Slack, Google), private key blocks, credential assignments, local tooling files, generated logs and files over a megabyte. It learns the login name and home directory from the environment at run time, so the script itself contains nothing personal. `--all` scans every commit on every branch; the published history passes it. GitHub's own secret scanning and push protection are enabled on the repository as the second layer.
+
 **Second opinion.** The code was reviewed by GPT-6-Astra, run through the Codex CLI at extra-high reasoning effort as a hostile senior engineer, after the first version. It found the rotation path that could truncate a file it had failed to rename, silent write failures, an exception from a sink taking the worker thread down, the thread-local timestamp cache being destroyed before static destructors run, data races on sink level and style, the logger lock being held while calling sinks, text-mode CRLF breaking the byte count, `flush` waiting for traffic that came after it, the async wrapper ignoring the inner sink's level, and a default-argument pattern GCC rejects. All of those are fixed. Most have a direct test (the refused rotation, the physical file size, the inner sink's level, the throwing sink, the flush barrier under load, sinks swapped under load); the teardown and data-race fixes are by construction and were re-reviewed rather than tested. Two of its points became documented contracts instead of code (callback reentrancy, one `ETCH_MIN_LEVEL` per program) and one is on the roadmap (deferred formatting).
 
 A third round, asked for speed and for what a model reading the logs would want, led to: two timestamp caches instead of one (a local-time text sink and a UTC JSON sink on the same thread were evicting each other every record), the JSON message reduced to its first line when the bytes or the stack are carried as data (nothing serialised twice), escaped string values in text fields, cheaper millisecond and hex rendering, a benchmark with optimisation barriers and sustained-load rows, a baseline gate and timeouts in the mutation script, and the README claims above corrected to what the measurements show. Its larger proposals (a smaller record, a per-file header with short thread ids and delta times, deferred formatting) are on the roadmap.
@@ -182,6 +184,7 @@ tests/support.hpp            shared test helpers: capturing logger, scratch dir,
 tests/test_*.cpp             the suite, one file per area (levels/logger, format, sinks, async, JSON)
 tests/main.cpp               test entry point
 tools/mutate.py              tests against deliberate bugs
+tools/prepush.py             pre-push hook: refuses local paths, secrets and local files
 ```
 
 ## Built with

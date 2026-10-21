@@ -18,3 +18,4 @@ CLAUDE.md
 RESEARCH.md
 ruff.toml
 *.jsonl
+__pycache__/
