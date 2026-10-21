@@ -7,11 +7,12 @@ project(etch
 
 # The library: header-only, so an INTERFACE target. Consumers do
 #   target_link_libraries(app PRIVATE etch::etch)
+include(GNUInstallDirs)
 add_library(etch INTERFACE)
 add_library(etch::etch ALIAS etch)
 target_include_directories(etch INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_compile_features(etch INTERFACE cxx_std_23)
 
 # MSVC's std::print writes UTF-8 to the console correctly only when the translation unit's
@@ -25,7 +26,9 @@ endif()
 # it on every target that links etch. 0 = trace (nothing compiled out) .. 5 = fatal.
 set(ETCH_MIN_LEVEL "" CACHE STRING "Compile out calls below this level (0..5) in every consumer")
 if(NOT ETCH_MIN_LEVEL STREQUAL "")
-  target_compile_definitions(etch INTERFACE ETCH_MIN_LEVEL=${ETCH_MIN_LEVEL})
+  # etch's own test targets set their floor themselves and opt out via this property.
+  target_compile_definitions(etch INTERFACE
+    $<$<NOT:$<BOOL:$<TARGET_PROPERTY:ETCH_OWN_MIN_LEVEL>>>:ETCH_MIN_LEVEL=${ETCH_MIN_LEVEL}>)
 endif()
 
 # The async sink starts a std::jthread; on some platforms that needs an explicit link.
@@ -54,7 +57,6 @@ endif()
 
 option(ETCH_INSTALL "Generate install rules and an etchConfig.cmake for find_package" ${PROJECT_IS_TOP_LEVEL})
 if(ETCH_INSTALL)
-  include(GNUInstallDirs)
   include(CMakePackageConfigHelpers)
   install(DIRECTORY include/etch DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
   install(TARGETS etch EXPORT etchTargets)
@@ -105,6 +107,7 @@ if(ETCH_BUILD_TESTS)
     tests/test_json.cpp)
 
   add_executable(etch_tests ${ETCH_TEST_SOURCES})
+  set_property(TARGET etch_tests PROPERTY ETCH_OWN_MIN_LEVEL ON)  # the suite assumes floor 0
   target_link_libraries(etch_tests PRIVATE etch::etch)
   etch_strict_warnings(etch_tests)
   add_test(NAME etch_tests COMMAND etch_tests)
@@ -112,6 +115,7 @@ if(ETCH_BUILD_TESTS)
 
   # Same suite with trace, debug and info compiled out, to prove ETCH_MIN_LEVEL works.
   add_executable(etch_tests_minlevel ${ETCH_TEST_SOURCES})
+  set_property(TARGET etch_tests_minlevel PROPERTY ETCH_OWN_MIN_LEVEL ON)
   target_link_libraries(etch_tests_minlevel PRIVATE etch::etch)
   target_compile_definitions(etch_tests_minlevel PRIVATE ETCH_MIN_LEVEL=3)
   etch_strict_warnings(etch_tests_minlevel)

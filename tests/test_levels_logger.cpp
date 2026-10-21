@@ -337,7 +337,7 @@ TEST(hexdump_limit_caps_text_and_bytes_and_null_is_reported) {
   CHECK(records[0].message.ends_with("... 5904 more bytes not shown"));
   CHECK_EQ(records[0].bytes.size(), etch::kDefaultHexdumpLimit);
   CHECK_EQ(records[0].user_message(), std::string_view("big (10000 bytes)"));
-  CHECK(records[1].message.find("(null pointer)") != std::string::npos);
+  CHECK(records[1].message.find("null pointer") != std::string::npos);
   CHECK(records[1].bytes.empty());
 }
 
@@ -390,6 +390,85 @@ TEST(null_arguments_throw_at_construction) {
     threw = true;
   }
   CHECK(threw);
+}
+
+TEST(off_is_never_a_record_level) {
+  Captured c;
+  c.log.log(etch::Level::kOff, "not a record");
+  CHECK_EQ(c.messages().size(), 0u);
+  CHECK(!c.sink->accepts(etch::Level::kOff));
+  CHECK(!c.log.enabled(etch::Level::kOff));
+}
+
+TEST(with_gate_level_skips_filtered_calls_and_keeps_fields_otherwise) {
+  Captured c;
+  c.log.set_level(etch::Level::kWarn);
+  c.log.with(etch::Level::kInfo, {{"k", 1}}).info("filtered");
+  c.log.with(etch::Level::kWarn, {{"k", 2}}).warn("kept");
+  {
+    auto timer =
+        c.log.with(etch::Level::kInfo, {{"k", 3}}).scope("skipped", {.level = etch::Level::kWarn});
+  }
+  const auto records = c.sink->records();
+  CHECK_EQ(records.size(), 1u);
+  if (records.empty()) return;
+  CHECK_EQ(records[0].message, std::string("kept"));
+  CHECK_EQ(records[0].fields.size(), 1u);
+}
+
+enum class CharBacked : char { kA = 'a' };
+
+struct Formattable {
+  int n;
+};
+}  // namespace
+template <>
+struct std::formatter<Formattable> : std::formatter<int> {
+  auto format(const Formattable& f, auto& ctx) const {
+    return std::formatter<int>::format(f.n, ctx);
+  }
+};
+namespace {
+
+TEST(field_conversions_handle_edge_cases) {
+  const etch::FieldValue ready{std::string("passed through")};
+  const char* null_text = nullptr;
+  const etch::Fields fields{
+      {"ready", ready},
+      {"null", null_text},
+      {"huge", std::chrono::seconds::max()},
+      {"nan", std::chrono::duration<double>(std::numeric_limits<double>::quiet_NaN())},
+      {"char_enum", CharBacked::kA},
+      {"custom", Formattable{42}},
+  };
+  CHECK_EQ(std::get<std::string>(fields[0].value), std::string("passed through"));
+  CHECK_EQ(std::get<std::string>(fields[1].value), std::string());
+  CHECK(std::get<std::int64_t>(fields[2].value) == std::numeric_limits<std::int64_t>::max());
+  CHECK(std::isnan(std::get<double>(fields[3].value)));
+  CHECK(std::get<std::int64_t>(fields[4].value) == 'a');
+  CHECK_EQ(std::get<std::string>(fields[5].value), std::string("42"));
+}
+
+TEST(text_stack_frames_show_base_names_only) {
+  Captured c{"unit", {.stacktrace_on_fatal = true}};
+  c.log.fatal("where");
+  const auto m = c.messages();
+  CHECK_EQ(m.size(), 1u);
+  if (m.empty()) return;
+  CHECK(m[0].find(":\\") == std::string::npos);  // no Windows drive path
+  CHECK(m[0].find("/home/") == std::string::npos);
+  CHECK(m[0].find("/mnt/") == std::string::npos);
+}
+
+TEST(hexdump_null_pointer_is_in_the_json_message) {
+  Captured c;
+  c.log.hexdump(etch::Level::kWarn, "p", nullptr, 16);
+  const auto records = c.sink->records();
+  CHECK_EQ(records.size(), 1u);
+  if (records.empty()) return;
+  std::string json;
+  etch::format_json(records[0], json);
+  CHECK(json.find("null pointer") != std::string::npos);
 }
 
 }  // namespace

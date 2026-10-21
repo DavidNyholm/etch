@@ -3,7 +3,8 @@
 Scans the commits that are about to leave this machine (their added lines, file names and
 messages) for local paths, home directories, the current login name as a path segment,
 e-mail addresses other than GitHub's noreply one, token-shaped strings, private keys, local
-tooling files and large binaries. Nothing here knows your name or paths: it reads them from
+tooling files and large binaries. It is a heuristic: it reads text that git shows as added
+(merge commits against their first parent) and file names; it does not decode binary files. Nothing here knows your name or paths: it reads them from
 the environment at run time, so the script itself contains nothing personal.
 
     python tools/prepush.py --install     # install as .git/hooks/pre-push (once per clone)
@@ -139,7 +140,10 @@ def check_range(findings: Findings, rev_range: str, extra: list[tuple[str, re.Pa
         for address in author.split():
             if not address.endswith(ALLOWED_EMAIL_SUFFIXES):
                 findings.add(f"{short} author/committer", "e-mail address", address)
-        for line in git("diff-tree", "--no-commit-id", "-r", "--name-only", sha).splitlines():
+        for line in git(
+            "diff-tree", "--no-commit-id", "-r", "--name-only", "--root", "-m", "--first-parent", sha
+        ).splitlines():
+            check_text(findings, f"{short} file name", line, extra)  # a path can leak too
             for pattern in BLOCKED_FILE_PATTERNS:
                 if re.search(pattern, line):
                     findings.add(f"{short} {line}", "file that must stay local", line)
@@ -150,7 +154,7 @@ def check_range(findings: Findings, rev_range: str, extra: list[tuple[str, re.Pa
                 continue  # deleted in this commit
             if size > LARGE_FILE_BYTES:
                 findings.add(f"{short} {line}", "large file", f"{size} bytes")
-        diff = git("show", "--format=", "--unified=0", "--no-color", sha)
+        diff = git("show", "--format=", "--unified=0", "--no-color", "-m", "--first-parent", sha)
         current_file = ""
         for raw in diff.splitlines():
             if raw.startswith("+++ "):

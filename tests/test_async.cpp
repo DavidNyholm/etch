@@ -286,4 +286,99 @@ TEST(shutdown_drains_then_writes_straight_through) {
   CHECK_EQ(async->queued(), 0u);
 }
 
+TEST(shutdown_with_a_blocked_producer_delivers_every_record_once) {
+  std::vector<std::string> delivered;
+  std::mutex m;
+  auto slow = std::make_shared<etch::CallbackSink>([&](const etch::Record& r) {
+    const auto until = std::chrono::steady_clock::now() + 300us;
+    while (std::chrono::steady_clock::now() < until) {
+    }
+    std::lock_guard lock(m);
+    delivered.push_back(r.message);
+  });
+  auto async = std::make_shared<etch::AsyncSink>(slow, 2, etch::AsyncSink::Overflow::kBlock);
+  etch::Logger log{"blocked", {async}};
+  constexpr int kSent = 40;
+  std::jthread producer([&] {
+    for (int i = 0; i < kSent; ++i) log.warn("record {}", i);
+  });
+  while (async->queued() < 2) std::this_thread::yield();  // the producer is now blocking
+  async->shutdown();
+  producer.join();
+  std::lock_guard lock(m);
+  CHECK_EQ(delivered.size(), static_cast<std::size_t>(kSent));
+  std::vector<std::string> expected;
+  for (int i = 0; i < kSent; ++i) expected.push_back(std::format("record {}", i));
+  CHECK_EQ(delivered, expected);  // every record once, in order, none empty
+}
+
+TEST(shutdown_from_two_threads_at_once_is_safe) {
+  std::atomic<int> delivered{0};
+  auto async = std::make_shared<etch::AsyncSink>(slow_sink(delivered, 50us));
+  etch::Logger log{"twice", {async}};
+  for (int i = 0; i < 20; ++i) log.warn("{}", i);
+  {
+    std::jthread a([&] { async->shutdown(); });
+    std::jthread b([&] { async->shutdown(); });
+  }
+  CHECK_EQ(delivered.load(), 20);
+  log.warn("after");
+  CHECK_EQ(delivered.load(), 21);
+}
+
+TEST(gap_report_matches_the_drop_count_exactly_after_flush) {
+  std::vector<etch::Record> delivered;
+  std::mutex m;
+  auto slow = std::make_shared<etch::CallbackSink>([&](const etch::Record& r) {
+    const auto until = std::chrono::steady_clock::now() + 200us;
+    while (std::chrono::steady_clock::now() < until) {
+    }
+    std::lock_guard lock(m);
+    delivered.push_back(r);
+  });
+  auto async = std::make_shared<etch::AsyncSink>(slow, 2, etch::AsyncSink::Overflow::kDrop,
+                                                 etch::Level::kOff);
+  etch::Logger log{"gap", {async}};
+  for (int i = 0; i < 60; ++i) log.warn("noise {}", i);
+  log.flush();
+  CHECK(async->dropped() > 0);
+  std::lock_guard lock(m);
+  std::size_t marked = 0;
+  for (const auto& r : delivered) {
+    if (r.logger_name == "etch") marked += std::get<std::int64_t>(r.fields.at(0).value);
+  }
+  CHECK_EQ(marked, async->dropped());  // flush returns with every drop reported
+}
+
+struct FlushCounter final : etch::Sink {
+  std::atomic<int> writes{0};
+  std::atomic<int> flushes{0};
+  void write(const etch::Record&) override { ++writes; }
+  void flush() override { ++flushes; }
+};
+
+TEST(idle_worker_flushes_the_inner_sink) {
+  auto counter = std::make_shared<FlushCounter>();
+  auto async = std::make_shared<etch::AsyncSink>(counter);
+  etch::Logger log{"idle", {async}};
+  for (int i = 0; i < 10; ++i) log.warn("{}", i);
+  // No flush() call: the worker must do it on its own once the queue has gone idle.
+  for (int i = 0; i < 500 && counter->flushes.load() == 0; ++i) std::this_thread::sleep_for(1ms);
+  CHECK(counter->flushes.load() > 0);
+  CHECK_EQ(counter->writes.load(), 10);
+}
+
+TEST(flush_all_while_async_sinks_come_and_go) {
+  std::atomic<bool> stop{false};
+  std::jthread churn([&] {
+    while (!stop.load()) {
+      auto sink = std::make_shared<etch::AsyncSink>(std::make_shared<etch::MemorySink>(4));
+      etch::Logger log{"churn", {sink}};
+      log.warn("x");
+    }
+  });
+  for (int i = 0; i < 200; ++i) etch::flush_all();
+  stop = true;
+}
+
 }  // namespace

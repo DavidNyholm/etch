@@ -63,7 +63,7 @@ class Sink {
   // are logging.
   void set_level(Level level) noexcept { min_level_.store(level, std::memory_order_relaxed); }
   Level get_level() const noexcept { return min_level_.load(std::memory_order_relaxed); }
-  bool accepts(Level level) const noexcept { return level >= get_level(); }
+  bool accepts(Level level) const noexcept { return level < Level::kOff && level >= get_level(); }
 
  private:
   std::atomic<Level> min_level_{Level::kTrace};
@@ -224,19 +224,34 @@ namespace detail {
 
 // Every path with an open FileSink, so a second FileSink on the same file is refused instead of
 // the two rotating each other's file away (or, on Windows, blocking each other's rotation).
+// Never destroyed: a FileSink owned by a global may be destroyed after any static would be.
 inline std::mutex& open_paths_mutex() {
-  static std::mutex m;
-  return m;
+  static std::mutex* const m = new std::mutex;
+  return *m;
 }
 inline std::set<std::string>& open_paths() {
-  static std::set<std::string> paths;
-  return paths;
+  static std::set<std::string>* const paths = new std::set<std::string>;
+  return *paths;
 }
 
+// One spelling per file: symlinks and ".." resolved where the filesystem allows, and on
+// Windows case and separators folded, so "Logs/a.log" and "logs/../LOGS/A.LOG" collide.
 inline std::string path_key(const std::filesystem::path& path) {
   std::error_code ec;
-  const auto absolute = std::filesystem::absolute(path, ec);
-  return utf8(ec ? path : absolute.lexically_normal());
+  auto resolved = std::filesystem::weakly_canonical(path, ec);
+  if (ec) {
+    resolved = std::filesystem::absolute(path, ec);
+    if (ec) resolved = path;
+    resolved = resolved.lexically_normal();
+  }
+  std::string key = utf8(resolved);
+#if defined(_WIN32)
+  for (char& c : key) {
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
+    if (c == '/') c = '\\';
+  }
+#endif
+  return key;
 }
 
 }  // namespace detail
@@ -264,7 +279,16 @@ class FileSink final : public Sink {
         return std::unexpected(std::make_error_code(std::errc::device_or_resource_busy));
       }
     }
-    auto sink = std::shared_ptr<FileSink>(new FileSink(path, options, key));
+    std::shared_ptr<FileSink> sink;
+    try {
+      sink = std::shared_ptr<FileSink>(new FileSink(path, options, key));
+    } catch (...) {
+      std::lock_guard lock(detail::open_paths_mutex());
+      detail::open_paths().erase(key);  // the destructor that would have done it never runs
+      throw;
+    }
+    // From here the sink's destructor releases the reservation, including on the failure
+    // return below (the shared_ptr goes out of scope).
     if (options.create_directories && path.has_parent_path()) {
       std::error_code ec;
       std::filesystem::create_directories(path.parent_path(), ec);  // reopen() reports failure
@@ -277,6 +301,7 @@ class FileSink final : public Sink {
     {
       std::lock_guard lock(mutex_);
       flush_locked();
+      out_.close();  // release the handle before another sink may take the path
     }
     std::lock_guard lock(detail::open_paths_mutex());
     detail::open_paths().erase(key_);

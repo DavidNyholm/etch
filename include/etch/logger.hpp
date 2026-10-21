@@ -72,12 +72,11 @@ inline std::string format_hexdump(std::string_view label, const void* data, std:
   constexpr unsigned char kFirstPrintable = 0x20;
   constexpr unsigned char kLastPrintable = 0x7e;
 
-  std::string out = std::format("{} ({} bytes)", label, size);
+  // A null pointer is said in the label line, so it survives into the JSON message too.
+  const bool null_data = data == nullptr && size > 0;
+  std::string out = std::format("{} ({} bytes{})", label, size, null_data ? ", null pointer" : "");
   if (label_length != nullptr) *label_length = out.size();
-  if (data == nullptr && size > 0) {
-    out += "\n  (null pointer)";
-    return out;
-  }
+  if (null_data) return out;
   const auto* bytes = static_cast<const unsigned char*>(data);
   const std::size_t shown = std::min(size, limit);
   auto app = std::back_inserter(out);
@@ -115,14 +114,12 @@ namespace detail {
 
 // The directory etch's headers live in, from the compiler's point of view, so stack frames
 // inside etch can be recognised by their source file and left out of a fatal's stacktrace.
-inline std::string_view etch_include_dir() {
-  static const std::string dir = [] {
-    const std::string_view here = std::source_location::current().file_name();
-    const auto cut = here.find_last_of("/\\");
-    return std::string(cut == std::string_view::npos ? std::string_view{}
-                                                     : here.substr(0, cut + 1));
-  }();
-  return dir;
+// A view into the compiler's own string literal: nothing is constructed or destroyed, so it is
+// valid at any point of process teardown.
+constexpr std::string_view etch_include_dir() noexcept {
+  constexpr std::string_view here = std::source_location::current().file_name();
+  constexpr auto cut = here.find_last_of("/\\");
+  return cut == std::string_view::npos ? std::string_view{} : here.substr(0, cut + 1);
 }
 
 inline bool same_path_prefix(std::string_view path, std::string_view prefix) noexcept {
@@ -270,8 +267,9 @@ class Logger {
 
   void set_level(Level level) noexcept { level_.store(level, std::memory_order_relaxed); }
   Level get_level() const noexcept { return level_.load(std::memory_order_relaxed); }
+  // kOff is a setting, never a record level: nothing is logged "at off".
   bool enabled(Level level) const noexcept {
-    return level >= kCompileTimeMinLevel && level >= get_level();
+    return level < Level::kOff && level >= kCompileTimeMinLevel && level >= get_level();
   }
 
   // The level is a template parameter so calls below ETCH_MIN_LEVEL compile to nothing. The
@@ -323,9 +321,12 @@ class Logger {
 
   // Attaches structured fields to one log call: log.with({{"fps", 59.2}}).warn("slow frame").
   // Text output appends them as key=value; JSON output gets them as a "fields" object. The
-  // entry is for use in that one expression: it only looks at the fields if the level passes,
-  // so a filtered call with fields costs nothing more than a filtered call without.
+  // entry owns a copy of the fields and is meant for that one expression. The values are
+  // converted when the braces are evaluated, before any level check; the overload that takes a
+  // level skips the copy when that level is filtered, which is the cheap form for a hot path:
+  // log.with(Level::kTrace, {{"frame", n}}).trace("...").
   Entry with(std::initializer_list<Field> fields) &;
+  Entry with(Level gate, std::initializer_list<Field> fields) &;
   Entry with(Fields fields) &;
 
   // Dumps raw memory. The pointer overload takes anything; the range overload takes any
@@ -437,13 +438,16 @@ class Logger {
     for (const auto& entry : std::stacktrace::current()) {
       Frame frame{entry.description(), entry.source_file(),
                   static_cast<std::uint32_t>(entry.source_line())};
+      // Two signals for "this frame is etch": its source file lives under etch's include
+      // directory, or its symbol is in namespace etch (a build without source information).
       if (detail::same_path_prefix(frame.file, own)) continue;
+      if (frame.description.find("etch::") != std::string::npos) continue;
       if (frame.description.empty() && frame.file.empty()) continue;  // nothing to show
       r.message += "\n    ";
       r.message += frame.description;
       if (!frame.file.empty()) {
         r.message += " at ";
-        r.message += frame.file;
+        r.message += detail::base_name(frame.file);  // the full path stays out of text too
         r.message += ':';
         r.message += std::to_string(frame.line);
       }
@@ -501,13 +505,20 @@ inline ScopeTimer::~ScopeTimer() {
 // a view of the braced list until the level check passes.)
 class Logger::Entry {
  public:
-  Entry(Logger& logger, std::initializer_list<Field> fields) : logger_(logger), view_(fields) {}
+  Entry(Logger& logger, std::initializer_list<Field> fields) : logger_(logger), owned_(fields) {}
   Entry(Logger& logger, Fields fields) : logger_(logger), owned_(std::move(fields)) {}
+  // Gated: when the level is filtered the fields are not even copied.
+  Entry(Logger& logger, Level gate, std::initializer_list<Field> fields)
+      : logger_(logger), active_(logger.enabled(gate)) {
+    if (active_) owned_ = Fields(fields);
+  }
+  Entry(const Entry&) = delete;
+  Entry& operator=(const Entry&) = delete;
 
   template <Level L, class... Args>
   void log_at(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) && {
     if constexpr (L >= kCompileTimeMinLevel) {
-      if (!logger_.enabled(L)) return;
+      if (!active_ || !logger_.enabled(L)) return;
       Record r;
       r.level = L;
       r.where = fmt.where;
@@ -518,7 +529,7 @@ class Logger::Entry {
   }
   template <class... Args>
   void log(Level level, FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) && {
-    if (!logger_.enabled(level)) return;
+    if (!active_ || !logger_.enabled(level)) return;
     Record r;
     r.level = level;
     r.where = fmt.where;
@@ -554,7 +565,7 @@ class Logger::Entry {
   void hexdump(Level level, std::string_view label, const void* data, std::size_t size,
                std::size_t limit = kDefaultHexdumpLimit,
                std::source_location where = std::source_location::current()) && {
-    if (!logger_.enabled(level)) return;
+    if (!active_ || !logger_.enabled(level)) return;
     Record r = Logger::hexdump_record(level, label, data, size, limit, where);
     r.fields = take();
     logger_.emit(std::move(r));
@@ -571,22 +582,23 @@ class Logger::Entry {
   // A scope timer whose begin and end lines carry the fields.
   [[nodiscard]] ScopeTimer scope(std::string_view what, ScopeOptions options = ScopeOptions{},
                                  std::source_location where = std::source_location::current()) && {
+    if (!active_) options.level = Level::kOff;  // a filtered gate: the timer logs nothing
     return ScopeTimer(logger_, options, std::string(what), where, take());
   }
 
  private:
-  Fields take() {
-    if (!owned_.empty() || view_.size() == 0) return std::move(owned_);
-    return Fields(view_.begin(), view_.end());
-  }
+  Fields take() { return std::move(owned_); }
 
   Logger& logger_;
-  std::initializer_list<Field> view_;  // empty by default
+  bool active_ = true;  // false: the gating level was filtered, nothing is logged
   Fields owned_;
 };
 
 inline Logger::Entry Logger::with(std::initializer_list<Field> fields) & {
   return Entry(*this, fields);
+}
+inline Logger::Entry Logger::with(Level gate, std::initializer_list<Field> fields) & {
+  return Entry(*this, gate, fields);
 }
 inline Logger::Entry Logger::with(Fields fields) & { return Entry(*this, std::move(fields)); }
 
@@ -667,6 +679,9 @@ void log(Level level, FormatWithLocation<std::type_identity_t<Args>...> fmt, Arg
 inline Logger::Entry with(std::initializer_list<Field> fields) {
   return default_logger().with(fields);
 }
+inline Logger::Entry with(Level gate, std::initializer_list<Field> fields) {
+  return default_logger().with(gate, fields);
+}
 inline Logger::Entry with(Fields fields) { return default_logger().with(std::move(fields)); }
 inline void hexdump(Level level, std::string_view label, const void* data, std::size_t size,
                     std::size_t limit = kDefaultHexdumpLimit,
@@ -684,6 +699,11 @@ void hexdump(Level level, std::string_view label, const R& range,
     std::string_view what, Level level = Level::kDebug,
     std::source_location where = std::source_location::current()) {
   return default_logger().scope(what, level, where);
+}
+[[nodiscard]] inline ScopeTimer scope(
+    std::string_view what, ScopeOptions options,
+    std::source_location where = std::source_location::current()) {
+  return default_logger().scope(what, options, where);
 }
 
 }  // namespace etch

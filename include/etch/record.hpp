@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -54,12 +55,15 @@ struct IsDuration<std::chrono::duration<Rep, Period>> : std::true_type {};
 template <class T>
 FieldValue to_field_value(const T& v) {
   using U = std::remove_cvref_t<T>;
-  if constexpr (std::is_same_v<U, bool>) {
+  if constexpr (std::is_same_v<U, FieldValue>) {
+    return v;
+  } else if constexpr (std::is_same_v<U, bool>) {
     return v;
   } else if constexpr (std::is_same_v<U, char>) {
     return std::string(1, v);
   } else if constexpr (std::is_enum_v<U>) {
-    return to_field_value(static_cast<std::underlying_type_t<U>>(v));
+    // Always a number, even for an enum backed by char.
+    return static_cast<std::int64_t>(std::to_underlying(v));
   } else if constexpr (std::is_integral_v<U>) {
     if constexpr (std::is_signed_v<U>) {
       return static_cast<std::int64_t>(v);
@@ -72,16 +76,24 @@ FieldValue to_field_value(const T& v) {
   } else if constexpr (std::is_floating_point_v<U>) {
     return static_cast<double>(v);
   } else if constexpr (IsDuration<U>::value) {
-    return static_cast<std::int64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(v).count());
+    // Whole nanoseconds, computed in long double so a huge duration clamps instead of
+    // overflowing; a non-finite floating duration stays non-finite (JSON writes null).
+    const long double ns = std::chrono::duration<long double, std::nano>(v).count();
+    if (!std::isfinite(ns)) return static_cast<double>(ns);
+    // int64's limits are not exactly representable in a 64-bit long double; compare, do not cast.
+    constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
+    constexpr auto kMin = std::numeric_limits<std::int64_t>::min();
+    if (ns >= static_cast<long double>(kMax)) return kMax;
+    if (ns <= static_cast<long double>(kMin)) return kMin;
+    return static_cast<std::int64_t>(ns);
   } else if constexpr (std::is_same_v<U, std::filesystem::path>) {
     return utf8(v);
   } else if constexpr (StringLike<U>) {
     return std::string(std::string_view(v));
-  } else if constexpr (std::formattable<U, char>) {
+  } else if constexpr (std::formattable<const U&, char>) {
     return std::format("{}", v);
   } else {
-    static_assert(std::formattable<U, char>,
+    static_assert(std::formattable<const U&, char>,
                   "etch: a field value must be a number, bool, string, char, enum, chrono "
                   "duration, filesystem path, or a type with a std::formatter");
   }
@@ -95,7 +107,7 @@ struct Field {
 
   template <class T>
   Field(std::string_view k, const T& v) : key(k), value(detail::to_field_value(v)) {}
-  Field(std::string_view k, const char* v) : key(k), value(std::string(v)) {}
+  Field(std::string_view k, const char* v) : key(k), value(std::string(v == nullptr ? "" : v)) {}
 };
 using Fields = std::vector<Field>;
 

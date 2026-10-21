@@ -186,4 +186,29 @@ TEST(file_sink_creates_missing_parent_directories) {
   CHECK_EQ(read_lines(path).size(), 1u);
 }
 
+TEST(file_sink_refuses_the_same_file_spelled_differently) {
+  const auto dir = scratch_dir() / "alias";
+  std::filesystem::create_directories(dir);
+  auto first = etch::FileSink::open(dir / "x.log", {.truncate = true});
+  CHECK(first.has_value());
+  auto dotdot = etch::FileSink::open(dir / ".." / "alias" / "x.log");
+  CHECK(!dotdot.has_value());
+#if defined(_WIN32)
+  auto upper = etch::FileSink::open(dir / "X.LOG");
+  CHECK(!upper.has_value());
+#endif
+}
+
+TEST(file_sink_reservation_is_released_when_open_fails) {
+  const auto blocker = scratch_dir() / "blocker2";
+  std::ofstream(blocker) << "not a directory";
+  const auto path = blocker / "y.log";
+  auto first = etch::FileSink::open(path);
+  CHECK(!first.has_value());
+  auto second = etch::FileSink::open(path);
+  CHECK(!second.has_value());
+  if (!second)
+    CHECK(second.error() != std::errc::device_or_resource_busy);  // the real error, not "busy"
+}
+
 }  // namespace

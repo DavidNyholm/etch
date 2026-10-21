@@ -50,7 +50,12 @@ MUTATIONS = [
     (
         "sinks.hpp",
         "sink level filter off by one",
-        [("return level >= get_level();", "return level > get_level();")],
+        [
+            (
+                "return level < Level::kOff && level >= get_level();",
+                "return level < Level::kOff && level > get_level();",
+            ),
+        ],
     ),
     (
         "sinks.hpp",
@@ -85,7 +90,9 @@ MUTATIONS = [
     (
         "async_sink.hpp",
         "dropped records are not counted",
-        [("dropped_.fetch_add(1, std::memory_order_relaxed);", ";")],
+        [
+            ("dropped_.fetch_add(1, std::memory_order_seq_cst);", ";"),
+        ],
     ),
     (
         "async_sink.hpp",
@@ -94,12 +101,12 @@ MUTATIONS = [
     ),
     (
         "async_sink.hpp",
-        "an exception from the inner sink escapes the worker",
+        "an exception from the inner sink is swallowed uncounted",
         [
             (
-                "for (auto& queued : batch) write_inner(std::move(queued));",
-                "for (auto& queued : batch) inner_->write(std::move(queued));",
-            )
+                "  void write_inner(Record&& r) noexcept {\n    try {\n      inner_->write(std::move(r));\n    } catch (...) {\n      write_failures_.fetch_add(1, std::memory_order_relaxed);\n    }\n  }",
+                "  void write_inner(Record&& r) noexcept {\n    try {\n      inner_->write(std::move(r));\n    } catch (...) {\n    }\n  }",
+            ),
         ],
     ),
     (
@@ -107,10 +114,9 @@ MUTATIONS = [
         "flush waits for the queue to be idle instead of for its own records",
         [
             (
-                "return written_pos_.load(std::memory_order_acquire) >= target;",
-                "return empty() && written_pos_.load(std::memory_order_acquire) >= "
-                "dequeue_pos_.load(std::memory_order_acquire);",
-            )
+                "written_pos_.load(std::memory_order_acquire) >= target &&",
+                "empty() && written_pos_.load(std::memory_order_acquire) >= dequeue_pos_.load(std::memory_order_acquire) &&",
+            ),
         ],
     ),
     (
@@ -118,9 +124,9 @@ MUTATIONS = [
         "logger level filter off by one",
         [
             (
-                "return level >= kCompileTimeMinLevel && level >= get_level();",
-                "return level >= kCompileTimeMinLevel && level > get_level();",
-            )
+                "return level < Level::kOff && level >= kCompileTimeMinLevel && level >= get_level();",
+                "return level < Level::kOff && level >= kCompileTimeMinLevel && level > get_level();",
+            ),
         ],
     ),
     ("logger.hpp", "hexdump loses the gap after eight bytes", [("if (i == kGapAfter) out += ' ';", "")]),
@@ -168,22 +174,25 @@ MUTATIONS = [
     (
         "async_sink.hpp",
         "no gap marker after dropped records",
-        [("if (dropped_now != dropped_reported_) write_gap_marker(dropped_now);", ";")],
+        [("      if (marker.level < Level::kOff) inner_->write(std::move(marker));", "      ;")],
     ),
     (
         "async_sink.hpp",
-        "shutdown does not switch to writing through",
+        "late records are written before the ring drains at shutdown",
         [
             (
-                "    passthrough_.store(true, std::memory_order_release);\n    std::lock_guard lock(mutex_);",
-                "    std::lock_guard lock(mutex_);",
+                "        not_full_.wait(lock, [&] { return worker_gone_.load(std::memory_order_seq_cst); });",
+                "",
             )
         ],
     ),
     (
         "logger.hpp",
         "etch's own frames are not filtered from the stacktrace",
-        [("if (detail::same_path_prefix(frame.file, own)) continue;", "")],
+        [
+            ("      if (detail::same_path_prefix(frame.file, own)) continue;\n", ""),
+            ('      if (frame.description.find("etch::") != std::string::npos) continue;\n', ""),
+        ],
     ),
     (
         "logger.hpp",
