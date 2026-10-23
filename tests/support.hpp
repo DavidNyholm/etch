@@ -25,6 +25,12 @@
 
 #include "check.hpp"
 
+// The path of this test binary, so a test can start a fresh copy of it (first-use tests).
+inline std::string& test_executable() {
+  static std::string path;
+  return path;
+}
+
 struct Captured {
   std::shared_ptr<etch::MemorySink> sink = std::make_shared<etch::MemorySink>();
   etch::Logger log;

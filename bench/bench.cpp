@@ -34,9 +34,11 @@
 #define ETCH_BENCH_HAS_TSC 0
 #endif
 
-// Every allocation on the calling thread is counted, so a row can say how many a call made.
-// The global operator new is replaced for this program only; the worker thread's allocations
-// land in its own counter and are not reported.
+// Every ordinary allocation on the calling thread is counted, so a row can say how many a call
+// made. The global operator new is replaced for this program only; the worker thread's
+// allocations land in its own counter and are not reported. Over-aligned allocations
+// (operator new with std::align_val_t) go through the library's own versions and are not
+// counted; a log call makes none, the async sink's construction does.
 namespace {
 constinit thread_local std::size_t g_allocations = 0;
 }
@@ -64,11 +66,24 @@ void keep(const T& value) {
 }
 
 // The cycle counter where there is one: steady_clock ticks at 100 ns on Windows, too coarse to
-// time one 150 ns call. Ticks are converted to nanoseconds with the steady_clock time of the
-// whole run, so the mean is exact and only the percentiles rely on the counter's rate.
-std::uint64_t ticks() noexcept {
+// time one 150 ns call. RDTSC itself is not ordered against the instructions around it, so the
+// start read is fenced before and the stop read (RDTSCP, which waits for earlier instructions)
+// is fenced after; that is the usual bracket, and its own cost is measured below and removed.
+// Ticks are converted to nanoseconds with the steady_clock time of the whole run.
+std::uint64_t ticks_start() noexcept {
 #if ETCH_BENCH_HAS_TSC
+  _mm_lfence();
   return __rdtsc();
+#else
+  return static_cast<std::uint64_t>(Clock::now().time_since_epoch().count());
+#endif
+}
+std::uint64_t ticks_stop() noexcept {
+#if ETCH_BENCH_HAS_TSC
+  unsigned int aux = 0;
+  const std::uint64_t t = __rdtscp(&aux);
+  _mm_lfence();
+  return t;
 #else
   return static_cast<std::uint64_t>(Clock::now().time_since_epoch().count());
 #endif
@@ -83,47 +98,75 @@ struct Stats {
   double allocations = 0;  // per call
 };
 
-// The timing itself costs two counter reads per call; measured once on an empty call and taken
-// off every row, so the numbers are the call's own.
-double g_timing_overhead_ns = 0;
+// What the timing costs, measured on an empty call and removed from every row. Two numbers,
+// because they are different things: a sample brackets one call between two counter reads, so
+// the per-sample overhead is what those two reads cost; the mean comes from the whole loop, so
+// it also carries the loop and the sample store.
+double g_sample_overhead_ns = 0;  // taken off the percentiles
+double g_loop_overhead_ns = 0;    // taken off the mean
 
-// Runs f n times, timing every call, and reduces the samples. The per-call tick samples are
-// kept in the caller's vector so a multi-thread row can pool several threads' samples.
+// The raw outcome of a run: the sample vector is filled by the caller's measure_into().
+struct Raw {
+  double elapsed_ns = 0;
+  double ns_per_tick = 0;
+  std::size_t allocations = 0;
+  int calls = 0;
+};
+
+// Runs f n times, timing every call into `samples`. Reduction is a separate step so that an
+// end-to-end time (flush, join) can be taken before the samples are sorted.
 template <class F>
-Stats measure_into(std::vector<std::uint64_t>& samples, int n, F f) {
+Raw measure_into(std::vector<std::uint64_t>& samples, int n, F f) {
   samples.resize(static_cast<std::size_t>(n));
   const std::size_t allocations_before = g_allocations;
   const auto start = Clock::now();
-  const std::uint64_t first = ticks();
+  const std::uint64_t first = ticks_start();
   for (int i = 0; i < n; ++i) {
-    const std::uint64_t before = ticks();
+    const std::uint64_t before = ticks_start();
     f();
-    samples[static_cast<std::size_t>(i)] = ticks() - before;
+    samples[static_cast<std::size_t>(i)] = ticks_stop() - before;
   }
-  const std::uint64_t last = ticks();
+  const std::uint64_t last = ticks_stop();
   const double elapsed_ns = std::chrono::duration<double, std::nano>(Clock::now() - start).count();
-  const double ns_per_tick = last > first ? elapsed_ns / static_cast<double>(last - first) : 0;
-  const std::size_t allocations = g_allocations - allocations_before;
+  return Raw{.elapsed_ns = elapsed_ns,
+             .ns_per_tick = last > first ? elapsed_ns / static_cast<double>(last - first) : 0,
+             .allocations = g_allocations - allocations_before,
+             .calls = n};
+}
 
+Stats reduce(Raw raw, std::vector<std::uint64_t>& samples) {
   std::sort(samples.begin(), samples.end());
   const auto at = [&](double quantile) {
     const auto index = static_cast<std::size_t>(quantile * static_cast<double>(samples.size() - 1));
-    return static_cast<double>(samples[index]) * ns_per_tick;
+    return static_cast<double>(samples[index]) * raw.ns_per_tick;
   };
-  const auto net = [&](double ns) { return std::max(0.0, ns - g_timing_overhead_ns); };
-  return Stats{.mean_ns = net(elapsed_ns / n),
-               .p50_ns = net(at(0.5)),
-               .p99_ns = net(at(0.99)),
-               .p999_ns = net(at(0.999)),
-               .max_ns = net(at(1.0)),
-               .allocations = static_cast<double>(allocations) / n};
+  const auto sample = [&](double ns) { return std::max(0.0, ns - g_sample_overhead_ns); };
+  return Stats{.mean_ns = std::max(0.0, raw.elapsed_ns / raw.calls - g_loop_overhead_ns),
+               .p50_ns = sample(at(0.5)),
+               .p99_ns = sample(at(0.99)),
+               .p999_ns = sample(at(0.999)),
+               .max_ns = sample(at(1.0)),
+               .allocations = static_cast<double>(raw.allocations) / raw.calls};
 }
 
 template <class F>
 Stats measure(int n, F f) {
   std::vector<std::uint64_t> samples;
   samples.reserve(static_cast<std::size_t>(n));  // before measuring: not one of the call's own
-  return measure_into(samples, n, std::move(f));
+  const Raw raw = measure_into(samples, n, std::move(f));
+  return reduce(raw, samples);
+}
+
+// Measures the empty call and sets the two overheads from it.
+void calibrate(int n) {
+  g_sample_overhead_ns = 0;
+  g_loop_overhead_ns = 0;
+  std::vector<std::uint64_t> samples;
+  samples.reserve(static_cast<std::size_t>(n));
+  const Raw raw = measure_into(samples, n, [] {});
+  const Stats empty = reduce(raw, samples);
+  g_sample_overhead_ns = empty.p50_ns;
+  g_loop_overhead_ns = empty.mean_ns;
 }
 
 // The cheapest possible sink, to measure everything in front of it.
@@ -146,18 +189,58 @@ std::filesystem::path temp_log(std::string_view name) {
 }
 
 // Logs `calls` lines through an async sink in front of `inner` and reports the caller's cost and
-// the end-to-end time until everything is written.
+// the end-to-end time until everything is written (taken before the samples are reduced).
 void async_rows(std::string_view label, std::shared_ptr<etch::Sink> inner, std::size_t capacity,
                 int calls) {
   auto async = std::make_shared<etch::AsyncSink>(std::move(inner), capacity);
   etch::Logger log{"bench", {async}};
+  std::vector<std::uint64_t> samples;
+  samples.reserve(static_cast<std::size_t>(calls));
   const auto start = Clock::now();
-  const Stats caller = measure(calls, [&] { log.info("thread {} message {}", 3, 12345); });
+  const Raw raw = measure_into(samples, calls, [&] { log.info("thread {} message {}", 3, 12345); });
   async->flush();
   const auto total = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-  row(label, caller,
+  row(label, reduce(raw, samples),
       std::format("{} lines on disk after {:.1f} ms ({:.0f} ns per line)", calls, total,
                   total * 1e6 / calls));
+}
+
+// `threads` threads log `calls` lines between them through `sink`, each timing its own calls.
+// Mean and allocations are averaged over the threads; the percentiles are the slowest
+// thread's, since the slowest is what a frame waits for. The wall time is taken when the last
+// thread has finished logging, before any samples are reduced.
+void threads_rows(std::string_view label, std::shared_ptr<etch::Sink> sink, int threads,
+                  int calls) {
+  etch::Logger log{"bench", {std::move(sink)}};
+  const int calls_per_thread = calls / threads;
+  std::vector<Raw> raw(static_cast<std::size_t>(threads));
+  std::vector<std::vector<std::uint64_t>> samples(static_cast<std::size_t>(threads));
+  for (auto& v : samples) v.reserve(static_cast<std::size_t>(calls_per_thread));
+  const auto start = Clock::now();
+  {
+    std::vector<std::jthread> workers;
+    for (int t = 0; t < threads; ++t) {
+      workers.emplace_back([&, t] {
+        const auto index = static_cast<std::size_t>(t);
+        raw[index] = measure_into(samples[index], calls_per_thread,
+                                  [&] { log.info("thread {} message {}", t, 12345); });
+      });
+    }
+  }
+  const auto wall = std::chrono::duration<double, std::nano>(Clock::now() - start).count();
+  Stats pooled;
+  for (std::size_t i = 0; i < raw.size(); ++i) {
+    const Stats s = reduce(raw[i], samples[i]);
+    pooled.mean_ns += s.mean_ns / threads;
+    pooled.allocations += s.allocations / threads;
+    pooled.p50_ns = std::max(pooled.p50_ns, s.p50_ns);
+    pooled.p99_ns = std::max(pooled.p99_ns, s.p99_ns);
+    pooled.p999_ns = std::max(pooled.p999_ns, s.p999_ns);
+    pooled.max_ns = std::max(pooled.max_ns, s.max_ns);
+  }
+  row(label, pooled,
+      std::format("{:.0f} ns per call from outside (wall time / calls per thread)",
+                  wall / calls_per_thread));
 }
 
 }  // namespace
@@ -168,12 +251,12 @@ int main() {
   constexpr int kThreads = 4;
   std::string s;
 
-  g_timing_overhead_ns = measure(kCalls, [] {}).mean_ns;
+  calibrate(kCalls);
   std::println("etch benchmark: {} calls per row, Release build expected; nanoseconds on the",
                kCalls);
-  std::println("calling thread, minus the {:.0f} ns the timing itself costs per call; allocs is",
-               g_timing_overhead_ns);
-  std::println("heap allocations per call on that thread");
+  std::println("calling thread, minus what the timing costs ({:.0f} ns per sample, {:.0f} ns per",
+               g_sample_overhead_ns, g_loop_overhead_ns);
+  std::println("loop iteration); allocs is ordinary heap allocations per call on that thread");
   std::println("-- primitives --");
   header();
   row("system_clock::now",
@@ -233,45 +316,13 @@ int main() {
     std::filesystem::remove(path, ec);
   }
 
-  std::println("-- {} threads logging at once -> async -> null sink, burst --", kThreads);
+  std::println("-- {} threads logging at once --", kThreads);
   header();
+  threads_rows("-> null sink", std::make_shared<NullSink>(), kThreads, kCalls);
   {
-    auto null = std::make_shared<NullSink>();
-    auto async = std::make_shared<etch::AsyncSink>(null, kBurstQueue);
-    etch::Logger log{"bench", {async}};
-    constexpr int kCallsPerThread = kCalls / kThreads;
-    std::vector<Stats> per_thread(kThreads);
-    std::vector<std::vector<std::uint64_t>> samples(kThreads);
-    for (auto& v : samples) v.reserve(kCallsPerThread);
-    const auto start = Clock::now();
-    {
-      std::vector<std::jthread> threads;
-      for (int t = 0; t < kThreads; ++t) {
-        threads.emplace_back([&, t] {
-          const auto index = static_cast<std::size_t>(t);
-          per_thread[index] = measure_into(samples[index], kCallsPerThread,
-                                           [&] { log.info("thread {} message {}", t, 12345); });
-        });
-      }
-    }
-    const auto wall = std::chrono::duration<double, std::nano>(Clock::now() - start).count();
+    auto async = std::make_shared<etch::AsyncSink>(std::make_shared<NullSink>(), kBurstQueue);
+    threads_rows("-> async -> null sink, burst", async, kThreads, kCalls);
     async->flush();
-    // Mean and allocations averaged over the threads; percentiles of the slowest thread, since
-    // the slowest is what the frame waits for.
-    Stats pooled;
-    for (const Stats& t : per_thread) {
-      pooled.mean_ns += t.mean_ns / kThreads;
-      pooled.allocations += t.allocations / kThreads;
-      pooled.p50_ns = std::max(pooled.p50_ns, t.p50_ns);
-      pooled.p99_ns = std::max(pooled.p99_ns, t.p99_ns);
-      pooled.p999_ns = std::max(pooled.p999_ns, t.p999_ns);
-      pooled.max_ns = std::max(pooled.max_ns, t.max_ns);
-    }
-    row("per call, inside each thread", pooled,
-        std::format("mean of {} threads, percentiles of the slowest; dropped {}", kThreads,
-                    async->dropped()));
-    std::println("  {:<40} {:>7.0f}  wall time of the run / calls per thread, with thread start",
-                 "per call, from outside", wall / kCallsPerThread);
   }
   return 0;
 }

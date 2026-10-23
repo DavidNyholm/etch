@@ -7,6 +7,7 @@
 #include "support.hpp"
 
 int main(int argc, char** argv) {
+  test_executable() = argc > 0 ? argv[0] : "";
   std::println("etch tests (ETCH_MIN_LEVEL={}), scratch files in {}", ETCH_MIN_LEVEL,
                scratch_dir().string());
   const int result = check::run(argc, argv);

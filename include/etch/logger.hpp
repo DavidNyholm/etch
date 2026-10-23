@@ -23,8 +23,10 @@
 #include <utility>
 #include <vector>
 
+#include "context.hpp"
 #include "level.hpp"
 #include "record.hpp"
+#include "sink_set.hpp"
 #include "sinks.hpp"
 
 #if __has_include(<stacktrace>)
@@ -194,47 +196,52 @@ struct LoggerOptions {
   bool stacktrace_on_fatal = true;  // append std::stacktrace to every fatal message
 };
 
-using SinkList = std::vector<std::shared_ptr<Sink>>;
 
 namespace detail {
 
-// The sink list a logger and its children share. The list itself is an immutable snapshot: a
-// log call takes the shared lock only long enough to copy the snapshot's pointer, then calls
-// the sinks with no logger lock held, so a sink (or its callback) may replace the list, and a
-// replaced async sink joins its worker outside any lock. (A std::atomic<std::shared_ptr> would
-// do the same job but measured 70 ns slower per call on MSVC than a shared lock.)
-class SinkSet {
- public:
-  explicit SinkSet(SinkList sinks) : list_(share(std::move(sinks))) {}
-
-  std::shared_ptr<const SinkList> snapshot() const {
-    std::shared_lock lock(mutex_);
-    return list_;
-  }
-  void set(SinkList sinks) {
-    auto next = share(std::move(sinks));
-    std::shared_ptr<const SinkList> retired;  // destroyed after the lock is released
-    std::unique_lock lock(mutex_);
-    retired = std::exchange(list_, std::move(next));
-  }
-  void add(std::shared_ptr<Sink> sink) {
-    if (sink == nullptr) return;
-    std::shared_ptr<const SinkList> retired;
-    std::unique_lock lock(mutex_);
-    SinkList next = *list_;
-    next.push_back(std::move(sink));
-    retired = std::exchange(list_, share(std::move(next)));
-  }
-
- private:
-  static std::shared_ptr<const SinkList> share(SinkList sinks) {
-    std::erase(sinks, nullptr);  // a null sink is a programming error; dropping it beats a crash
-    return std::make_shared<const SinkList>(std::move(sinks));
-  }
-
-  mutable std::shared_mutex mutex_;
-  std::shared_ptr<const SinkList> list_;
+// One call site of every() or once(): when it last got through and how many calls were held
+// back since. Keyed by the call's source location (the file name is a string literal, so a
+// view of it stays valid for the life of the program). Never destroyed: a static destructor
+// may log.
+struct RateKey {
+  std::string_view file;  // compared by contents: the same header line in two translation
+                          // units can carry the same text at two addresses
+  std::uint_least32_t line = 0;
+  std::uint_least32_t column = 0;
+  auto operator<=>(const RateKey&) const = default;
 };
+struct RateState {
+  std::chrono::steady_clock::time_point last{};
+  std::uint64_t suppressed = 0;
+  bool fired = false;
+};
+struct RateRegistry {
+  std::mutex mutex;
+  std::map<RateKey, RateState> sites;
+};
+inline RateRegistry& rate_registry() {
+  static RateRegistry* const registry = new RateRegistry;
+  return *registry;
+}
+
+// Whether the call at `where` may go through: the first one always, then one per `interval`
+// (once() is an interval that never elapses). `suppressed` receives how many calls were held
+// back since the last one that went through, so the line that gets through can say so.
+inline bool admit_rate(const std::source_location& where, std::chrono::nanoseconds interval,
+                       bool once, std::uint64_t& suppressed) {
+  RateRegistry& registry = rate_registry();
+  std::lock_guard lock(registry.mutex);
+  RateState& state = registry.sites[RateKey{where.file_name(), where.line(), where.column()}];
+  const auto now = std::chrono::steady_clock::now();
+  if (state.fired && (once || now - state.last < interval)) {
+    ++state.suppressed;
+    return false;
+  }
+  state.fired = true;
+  state.last = now;
+  suppressed = std::exchange(state.suppressed, 0);
+  return true;
+}
 
 }  // namespace detail
 
@@ -338,6 +345,14 @@ class Logger {
   Entry with(Level gate, std::initializer_list<Field> fields) &;
   Entry with(Fields fields) &;
 
+  // Rate limiting per call site: log.every(5s).warn("still waiting") lets the first call
+  // through and then one per five seconds, and the line that gets through carries a
+  // `suppressed` field with how many were held back; log.once().info("...") logs the first
+  // call only. The key is the call's source location, so each line of code has its own
+  // budget. Fields can follow: log.every(1s).with({{"fps", fps}}).warn("slow").
+  Entry every(std::chrono::nanoseconds interval) &;
+  Entry once() &;
+
   // Dumps raw memory. The pointer overload takes anything; the range overload takes any
   // contiguous container (std::vector, std::array, std::string, std::span, ...). The text is
   // the hex editor view of the first `limit` bytes; the record also carries those bytes
@@ -402,19 +417,21 @@ class Logger {
     r.thread = std::this_thread::get_id();
     r.thread_index = detail::this_thread_index();
     r.logger_name = name_;
+    detail::append_context(r.fields);
     if (level == Level::kFatal && options_.stacktrace_on_fatal) append_stacktrace(r);
-    const auto sinks = sinks_->snapshot();
+    const detail::SinkSet::Use use(*sinks_);
+    const SinkList& sinks = use.list();
     // Every sink but the last gets a copy; the last takes the record itself, so the common
     // single-sink setup never copies the message.
     Sink* last = nullptr;
-    for (const auto& sink : *sinks) {
+    for (const auto& sink : sinks) {
       if (!sink->accepts(level)) continue;
       if (last != nullptr) last->write(r);
       last = sink.get();
     }
     if (last != nullptr) last->write(std::move(r));
     if (level == Level::kFatal) {
-      for (const auto& sink : *sinks) sink->flush();
+      for (const auto& sink : sinks) sink->flush();
     }
   }
 
@@ -521,13 +538,27 @@ class Logger::Entry {
       : logger_(logger), active_(logger.enabled(gate)) {
     if (active_) owned_ = Fields(fields);
   }
+  // Rate-gated: see Logger::every and Logger::once.
+  Entry(Logger& logger, std::chrono::nanoseconds interval, bool once)
+      : logger_(logger), interval_(interval), once_(once), rate_gated_(true) {}
   Entry(const Entry&) = delete;
   Entry& operator=(const Entry&) = delete;
+
+  // Fields on a rate-gated entry: log.every(1s).with({{"fps", fps}}).warn("slow").
+  Entry&& with(std::initializer_list<Field> fields) && {
+    owned_.insert(owned_.end(), fields.begin(), fields.end());
+    return std::move(*this);
+  }
+  Entry&& with(Fields fields) && {
+    owned_.insert(owned_.end(), std::make_move_iterator(fields.begin()),
+                  std::make_move_iterator(fields.end()));
+    return std::move(*this);
+  }
 
   template <Level L, class... Args>
   void log_at(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) && {
     if constexpr (L >= kCompileTimeMinLevel) {
-      if (!active_ || !logger_.enabled(L)) return;
+      if (!active_ || !logger_.enabled(L) || !admit(fmt.where)) return;
       Record r;
       r.level = L;
       r.where = fmt.where;
@@ -538,7 +569,7 @@ class Logger::Entry {
   }
   template <class... Args>
   void log(Level level, FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) && {
-    if (!active_ || !logger_.enabled(level)) return;
+    if (!active_ || !logger_.enabled(level) || !admit(fmt.where)) return;
     Record r;
     r.level = level;
     r.where = fmt.where;
@@ -574,7 +605,7 @@ class Logger::Entry {
   void hexdump(Level level, std::string_view label, const void* data, std::size_t size,
                std::size_t limit = kDefaultHexdumpLimit,
                std::source_location where = std::source_location::current()) && {
-    if (!active_ || !logger_.enabled(level)) return;
+    if (!active_ || !logger_.enabled(level) || !admit(where)) return;
     Record r = Logger::hexdump_record(level, label, data, size, limit, where);
     r.fields = take();
     logger_.emit(std::move(r));
@@ -591,16 +622,35 @@ class Logger::Entry {
   // A scope timer whose begin and end lines carry the fields.
   [[nodiscard]] ScopeTimer scope(std::string_view what, ScopeOptions options = ScopeOptions{},
                                  std::source_location where = std::source_location::current()) && {
-    if (!active_) options.level = Level::kOff;  // a filtered gate: the timer logs nothing
+    // Level first, so a filtered scope costs nothing and does not use up the budget.
+    if (!active_ || !logger_.enabled(options.level) || !admit(where)) options.level = Level::kOff;
     return ScopeTimer(logger_, options, std::string(what), where, take());
   }
 
  private:
   Fields take() { return std::move(owned_); }
 
+  // The rate gate, after the level check so a filtered call costs nothing and is not counted.
+  // When the call goes through after others were held back, the count rides on it as a field,
+  // replacing any field of that name the caller supplied.
+  static constexpr std::string_view kSuppressedField = "suppressed";
+  bool admit(const std::source_location& where) {
+    if (!rate_gated_) return true;
+    std::uint64_t suppressed = 0;
+    if (!detail::admit_rate(where, interval_, once_, suppressed)) return false;
+    if (suppressed > 0) {
+      std::erase_if(owned_, [](const Field& f) { return f.key == kSuppressedField; });
+      owned_.emplace_back(kSuppressedField, suppressed);
+    }
+    return true;
+  }
+
   Logger& logger_;
   bool active_ = true;  // false: the gating level was filtered, nothing is logged
   Fields owned_;
+  std::chrono::nanoseconds interval_{0};
+  bool once_ = false;
+  bool rate_gated_ = false;
 };
 
 inline Logger::Entry Logger::with(std::initializer_list<Field> fields) & {
@@ -610,109 +660,15 @@ inline Logger::Entry Logger::with(Level gate, std::initializer_list<Field> field
   return Entry(*this, gate, fields);
 }
 inline Logger::Entry Logger::with(Fields fields) & { return Entry(*this, std::move(fields)); }
-
-// A process-wide logger named "main" that writes to the console. Swap its sinks with
-// default_logger().set_sinks(...) to send it elsewhere; etch::get("name") makes named children
-// that share them.
-//
-// It is never destroyed, on purpose: objects with static storage may log from their
-// destructors, which can run after a function-local static logger would already be gone. An
-// atexit handler registered on first use flushes its sinks and marks the process as exiting,
-// after which file sinks flush every line, so even a destructor that runs later (one whose
-// object was constructed before the logger was first used) gets its lines out. Async sinks are
-// drained and switched to synchronous writes by their own exit handler (see etch::shutdown).
-inline Logger& default_logger() {
-  static Logger* const instance = [] {
-    auto* logger = new Logger{"main", {std::make_shared<ConsoleSink>()}};
-    std::atexit([] {
-      detail::process_exiting().store(true, std::memory_order_relaxed);
-      try {
-        default_logger().flush();
-      } catch (...) {
-        // A sink that throws on flush at exit has nowhere left to report to.
-      }
-    });
-    return logger;
-  }();
-  return *instance;
+inline Logger::Entry Logger::every(std::chrono::nanoseconds interval) & {
+  return Entry(*this, interval, /*once=*/false);
 }
-
-// A named logger that shares the default logger's sinks: etch::get("render").info(...). The
-// same name always gives the same logger, created on first use and never destroyed, so it can
-// be used from static destructors like the default logger.
-inline Logger& get(std::string_view name) {
-  struct Registry {
-    std::mutex mutex;
-    std::map<std::string, std::unique_ptr<Logger>, std::less<>> loggers;
-  };
-  static Registry* const registry = new Registry;
-  std::lock_guard lock(registry->mutex);
-  if (const auto it = registry->loggers.find(name); it != registry->loggers.end()) {
-    return *it->second;
-  }
-  auto logger = std::make_unique<Logger>(default_logger().child(std::string(name)));
-  Logger& ref = *logger;
-  registry->loggers.emplace(std::string(name), std::move(logger));
-  return ref;
-}
-
-// Free functions on the default logger: etch::info("hello {}", name).
-template <class... Args>
-void trace(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
-  default_logger().log_at<Level::kTrace>(fmt, std::forward<Args>(args)...);
-}
-template <class... Args>
-void debug(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
-  default_logger().log_at<Level::kDebug>(fmt, std::forward<Args>(args)...);
-}
-template <class... Args>
-void info(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
-  default_logger().log_at<Level::kInfo>(fmt, std::forward<Args>(args)...);
-}
-template <class... Args>
-void warn(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
-  default_logger().log_at<Level::kWarn>(fmt, std::forward<Args>(args)...);
-}
-template <class... Args>
-void error(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
-  default_logger().log_at<Level::kError>(fmt, std::forward<Args>(args)...);
-}
-template <class... Args>
-void fatal(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
-  default_logger().log_at<Level::kFatal>(fmt, std::forward<Args>(args)...);
-}
-template <class... Args>
-void log(Level level, FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
-  default_logger().log(level, fmt, std::forward<Args>(args)...);
-}
-inline Logger::Entry with(std::initializer_list<Field> fields) {
-  return default_logger().with(fields);
-}
-inline Logger::Entry with(Level gate, std::initializer_list<Field> fields) {
-  return default_logger().with(gate, fields);
-}
-inline Logger::Entry with(Fields fields) { return default_logger().with(std::move(fields)); }
-inline void hexdump(Level level, std::string_view label, const void* data, std::size_t size,
-                    std::size_t limit = kDefaultHexdumpLimit,
-                    std::source_location where = std::source_location::current()) {
-  default_logger().hexdump(level, label, data, size, limit, where);
-}
-template <std::ranges::contiguous_range R>
-  requires std::ranges::sized_range<R>
-void hexdump(Level level, std::string_view label, const R& range,
-             std::size_t limit = kDefaultHexdumpLimit,
-             std::source_location where = std::source_location::current()) {
-  default_logger().hexdump(level, label, range, limit, where);
-}
-[[nodiscard]] inline ScopeTimer scope(
-    std::string_view what, Level level = Level::kDebug,
-    std::source_location where = std::source_location::current()) {
-  return default_logger().scope(what, level, where);
-}
-[[nodiscard]] inline ScopeTimer scope(
-    std::string_view what, ScopeOptions options,
-    std::source_location where = std::source_location::current()) {
-  return default_logger().scope(what, options, where);
+inline Logger::Entry Logger::once() & {
+  return Entry(*this, std::chrono::nanoseconds{0}, /*once=*/true);
 }
 
 }  // namespace etch
+
+// The default logger, etch::get() and the free functions have always come with this header;
+// they live in their own file now, included last because they need the complete Logger.
+#include "default_logger.hpp"

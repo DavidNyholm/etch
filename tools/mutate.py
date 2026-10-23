@@ -48,6 +48,96 @@ MUTATIONS = [
         [('"\\x1b[33m",    // warn: yellow', '"",    // warn: yellow')],
     ),
     (
+        "sink_set.hpp",
+        "a replaced sink list is never revoked from the thread caches",
+        [
+            (
+                "if (e.set.load(std::memory_order_acquire) != this) continue;",
+                "if (e.set.load(std::memory_order_acquire) == this) continue;",
+            ),
+        ],
+    ),
+    (
+        "sink_set.hpp",
+        "a call that was revoked mid-flight keeps the old list",
+        [
+            (
+                "pinned_->list.reset();\n      pinned_->set.store(nullptr",
+                "pinned_->set.store(nullptr",
+            ),
+        ],
+    ),
+    (
+        "context.hpp",
+        "context fields never reach the record",
+        [
+            (
+                "if (stack == nullptr || stack->fields.empty()) return;",
+                "if (stack == nullptr || !stack->fields.empty()) return;",
+            ),
+        ],
+    ),
+    (
+        "context.hpp",
+        "an inner context does not shadow the outer one",
+        [("shadowed = context[j].key == key;", "shadowed = false;")],
+    ),
+    (
+        "context.hpp",
+        "context fields stay after the context ends",
+        [("if (!active_) return;", "if (true) return;")],
+    ),
+    (
+        "level.hpp",
+        "level spec takes the logger name as the level",
+        [
+            (
+                "equals == std::string_view::npos ? entry : trim(entry.substr(equals + 1));",
+                "equals == std::string_view::npos ? entry : trim(entry.substr(0, equals));",
+            ),
+        ],
+    ),
+    (
+        "default_logger.hpp",
+        "a named level is not applied to a logger made later",
+        [("    logger->set_level(it->second);\n", "")],
+    ),
+    (
+        "default_logger.hpp",
+        "the root level of a spec is ignored",
+        [("if (spec.root) root.set_level", "if (false) root.set_level")],
+    ),
+    (
+        "logger.hpp",
+        "once() fires every time",
+        [("  state.fired = true;\n", "")],
+    ),
+    (
+        "logger.hpp",
+        "every() never refills its budget",
+        [("now - state.last < interval", "now - state.last >= interval || true")],
+    ),
+    (
+        "logger.hpp",
+        "the suppressed count is never reported",
+        [("if (suppressed > 0) {", "if (suppressed < 0) {")],
+    ),
+    (
+        "logger.hpp",
+        "a filtered scope uses up the rate budget",
+        [
+            (
+                "if (!active_ || !logger_.enabled(options.level) || !admit(where)) options.level",
+                "if (!active_ || !admit(where) || !logger_.enabled(options.level)) options.level",
+            ),
+        ],
+    ),
+    (
+        "logger.hpp",
+        "a supplied suppressed field is kept next to the generated one",
+        [("      std::erase_if(owned_, [](const Field& f) { return f.key == kSuppressedField; });\n", "")],
+    ),
+    (
         "sinks.hpp",
         "sink level filter off by one",
         [
@@ -135,7 +225,7 @@ MUTATIONS = [
         "scope timer begin message changed",
         [('std::format("{}: begin", what_)', 'std::format("{}: start", what_)')],
     ),
-    ("logger.hpp", "null sinks are kept in the list", [("std::erase(sinks, nullptr);", "")]),
+    ("sink_set.hpp", "null sinks are kept in the list", [("std::erase(sinks, nullptr);", "")]),
     (
         "json.hpp",
         "JSON message is not escaped",

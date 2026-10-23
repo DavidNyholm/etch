@@ -4,9 +4,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <format>
 #include <optional>
+#include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace etch {
 
@@ -93,6 +97,57 @@ constexpr std::optional<Level> parse_level(std::string_view text) noexcept {
   if (is_prefix_of("fatal") || is_prefix_of("critical")) return Level::kFatal;
   if (is_prefix_of("off") || is_prefix_of("none")) return Level::kOff;
   return std::nullopt;
+}
+
+// Levels from text such as "warn,net=debug,render=trace": an entry without a name is the level
+// for the default logger (and so the starting level of every etch::get() logger made later),
+// "name=level" is the level for the etch::get() logger of that name. Entries are separated by
+// commas or semicolons; names and levels are trimmed; an empty entry is skipped. This is what
+// the ETCH_LEVEL environment variable holds; see etch::apply_level_spec in logger.hpp.
+struct LevelSpec {
+  std::optional<Level> root;
+  std::vector<std::pair<std::string, Level>> loggers;
+};
+
+// The spec, or a message naming the entry that could not be read.
+inline std::expected<LevelSpec, std::string> parse_level_spec(std::string_view text) {
+  LevelSpec spec;
+  while (!text.empty()) {
+    const std::size_t end = text.find_first_of(",;");
+    std::string_view entry = text.substr(0, end);
+    text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
+    const auto trim = [](std::string_view s) {
+      constexpr std::string_view kWhitespace = " \t\r\n";
+      while (!s.empty() && kWhitespace.find(s.front()) != std::string_view::npos) {
+        s.remove_prefix(1);
+      }
+      while (!s.empty() && kWhitespace.find(s.back()) != std::string_view::npos) {
+        s.remove_suffix(1);
+      }
+      return s;
+    };
+    entry = trim(entry);
+    if (entry.empty()) continue;
+    const std::size_t equals = entry.find('=');
+    const std::string_view name =
+        equals == std::string_view::npos ? "" : trim(entry.substr(0, equals));
+    const std::string_view level_text =
+        equals == std::string_view::npos ? entry : trim(entry.substr(equals + 1));
+    const std::optional<Level> level = parse_level(level_text);
+    if (!level) {
+      return std::unexpected(std::format(
+          "'{}' is not a level (trace, debug, info, warn, error, fatal, off)", level_text));
+    }
+    if (equals != std::string_view::npos && name.empty()) {
+      return std::unexpected(std::format("'{}' names no logger", entry));
+    }
+    if (name.empty()) {
+      spec.root = *level;
+    } else {
+      spec.loggers.emplace_back(std::string(name), *level);
+    }
+  }
+  return spec;
 }
 
 // Must be the same value in every translation unit of a program (set it on the target that

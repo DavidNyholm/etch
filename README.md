@@ -1,8 +1,8 @@
 # etch
 
-A small, header-only C++23 logger: `std::format` messages with file and line and no macros, a lock-free async queue, a colour console, rotating files, and JSON Lines with typed fields for programs and models to read. MSVC and GCC 14, standard library only. A hobby project built to try the C++23 library in anger, tested by building a game on it and by five review rounds from a second model.
+A small, header-only C++23 logger: `std::format` messages with file and line and no macros, a lock-free async queue, a colour console, rotating files, and JSON Lines with typed fields for programs and models to read. MSVC and GCC 14, standard library only. A hobby project built to try the C++23 library in anger, tested by building a game on it and by six review rounds from a second model.
 
-**Status:** v0.3.1 on `main`, verified on Windows (MSVC 2026 Insiders) and Linux (Ubuntu 24.04, GCC 14.2): 99 tests, 38 injected bugs all caught, zero warnings. Work in progress lives on `beta`. The [wiki](https://github.com/DavidNyholm/etch/wiki) has everything beyond this page.
+**Status:** v0.3.1 on `main`, verified on Windows (MSVC 2026 Insiders) and Linux (Ubuntu 24.04, GCC 14.2): 99 tests, 38 injected bugs all caught, zero warnings. Work in progress lives on `beta` (0.4.0: a lock-free sink list, context fields, `ETCH_LEVEL`, rate limiting, a debugger sink, benchmark percentiles). The [wiki](https://github.com/DavidNyholm/etch/wiki) has everything beyond this page.
 
 ## Quick start
 
@@ -51,10 +51,10 @@ The first two lines are the console (coloured in a terminal: level tag, a stable
 
 ## What it does
 
-- **Six levels** plus `off`, per logger and per sink, and a compile-time floor that removes calls from the binary.
+- **Six levels** plus `off`, per logger and per sink, settable from `ETCH_LEVEL=warn,net=debug` without a rebuild, and a compile-time floor that removes calls from the binary.
 - **Format strings checked at compile time**, with the call site's file and line captured through `std::source_location`, no macros.
-- **Sinks:** console, rotating file, memory (for tests and crash rings), callback, and an **async sink** on a lock-free ring that either blocks or drops, keeps warnings and above, and marks every gap. `shutdown()` and an exit handler make sure nothing queued is lost.
-- **Typed fields** (`with(...)`), hexdumps, scope timers with thresholds, named child loggers, and a fatal that carries a stacktrace with etch's own frames left out.
+- **Sinks:** console, rotating file, memory (for tests and crash rings), callback, debugger output (Visual Studio, DebugView, x64dbg), and an **async sink** on a lock-free ring that either blocks or drops, keeps warnings and above, and marks every gap. `shutdown()` and an exit handler make sure nothing queued is lost.
+- **Typed fields** (`with(...)`), per-thread **context fields** that ride on every line of a request or a frame, hexdumps, scope timers with thresholds, **rate limiting** per call site (`every(5s)`, `once()`, with the count of what was held back), named child loggers, and a fatal that carries a stacktrace with etch's own frames left out.
 - **JSON Lines** from any sink, UTF-8 validated, with an **agent profile** and a **run summary** (records per level and logger, drops, failures, first and last error) so a program reads the summary first and the log only when it must.
 - **Errors as values and counters:** opening a file returns `std::expected`; I/O failures are counted on the sink, never thrown from a log call.
 

@@ -105,7 +105,10 @@ if(ETCH_BUILD_TESTS)
     tests/test_sinks.cpp
     tests/test_async.cpp
     tests/test_json.cpp
-    tests/test_agent.cpp)
+    tests/test_agent.cpp
+    tests/test_context.cpp
+    tests/test_rate_limit.cpp
+    tests/test_logger_header_only.cpp)
 
   add_executable(etch_tests ${ETCH_TEST_SOURCES})
   set_property(TARGET etch_tests PROPERTY ETCH_OWN_MIN_LEVEL ON)  # the suite assumes floor 0

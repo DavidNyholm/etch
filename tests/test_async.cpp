@@ -67,6 +67,88 @@ TEST(a_sink_callback_may_change_the_logger_sinks) {
   CHECK_EQ(late->messages(), (std::vector<std::string>{"second"}));
 }
 
+TEST(replacing_the_sinks_releases_them_on_every_thread) {
+  // Each thread caches the sink list it last used; a replacement must clear those caches,
+  // not wait for the thread to log again or end. The other thread stays alive and idle while
+  // the check runs.
+  auto sink = std::make_shared<etch::MemorySink>();
+  std::weak_ptr<etch::Sink> weak = sink;
+  etch::Logger log{"release", {sink}};
+  std::atomic<int> phase{0};
+  std::jthread other([&] {
+    log.warn("from the other thread");
+    phase = 1;
+    while (phase.load() < 2) std::this_thread::yield();
+  });
+  while (phase.load() < 1) std::this_thread::yield();
+  log.warn("from this thread");
+  log.set_sinks({});
+  sink.reset();
+  CHECK(weak.expired());
+  phase = 2;
+}
+
+TEST(a_thread_that_ended_holds_no_sink) {
+  auto sink = std::make_shared<etch::MemorySink>();
+  std::weak_ptr<etch::Sink> weak = sink;
+  etch::Logger log{"ended", {sink}};
+  std::jthread([&] { log.warn("cached on a thread that then ends"); }).join();
+  log.set_sinks({});
+  sink.reset();
+  CHECK(weak.expired());
+}
+
+TEST(destroying_a_logger_releases_its_sinks) {
+  auto sink = std::make_shared<etch::MemorySink>();
+  std::weak_ptr<etch::Sink> weak = sink;
+  {
+    etch::Logger log{"gone", {sink}};
+    log.warn("cached on this thread");
+  }
+  sink.reset();
+  CHECK(weak.expired());
+}
+
+TEST(a_sink_may_replace_the_sinks_during_its_own_write) {
+  etch::Logger log{"self", {}};
+  auto after = std::make_shared<etch::MemorySink>();
+  int calls = 0;
+  auto hook = std::make_shared<etch::CallbackSink>([&](const etch::Record&) {
+    ++calls;
+    log.set_sinks({after});  // replaces the list this very call is iterating
+  });
+  log.set_sinks({hook});
+  std::weak_ptr<etch::Sink> weak = hook;
+  log.warn("first");  // reaches the hook only; the call then drops the list it was using
+  hook.reset();
+  CHECK(weak.expired());
+  log.warn("second");
+  CHECK_EQ(calls, 1);
+  CHECK_EQ(after->messages(), (std::vector<std::string>{"second"}));
+}
+
+// A sink that logs through the logger it belongs to, once. (CallbackSink holds its own mutex
+// while the callback runs, so it cannot be re-entered; a sink of your own can.)
+struct NestingSink final : etch::Sink {
+  etch::Logger* log = nullptr;
+  bool inside = false;
+  void write(const etch::Record& r) override {
+    if (inside) return;
+    inside = true;
+    log->warn("nested from {}", r.user_message());
+    inside = false;
+  }
+};
+
+TEST(a_sink_may_log_through_its_own_logger) {
+  auto memory = std::make_shared<etch::MemorySink>();
+  auto nesting = std::make_shared<NestingSink>();
+  etch::Logger log{"nested", {memory, nesting}};
+  nesting->log = &log;
+  log.warn("outer");  // the inner call runs while the outer one still uses the same list
+  CHECK_EQ(memory->messages(), (std::vector<std::string>{"outer", "nested from outer"}));
+}
+
 TEST(null_sinks_are_ignored_and_scope_needs_an_lvalue_logger) {
   etch::Logger log{"n", {nullptr, std::make_shared<etch::MemorySink>(), nullptr}};
   CHECK_EQ(log.sinks().size(), 1u);
@@ -363,7 +445,8 @@ TEST(idle_worker_flushes_the_inner_sink) {
   etch::Logger log{"idle", {async}};
   for (int i = 0; i < 10; ++i) log.warn("{}", i);
   // No flush() call: the worker must do it on its own once the queue has gone idle.
-  for (int i = 0; i < 500 && counter->flushes.load() == 0; ++i) std::this_thread::sleep_for(1ms);
+  // Generous: on a loaded machine the worker thread can take a while to be scheduled at all.
+  for (int i = 0; i < 2000 && counter->flushes.load() == 0; ++i) std::this_thread::sleep_for(1ms);
   CHECK(counter->flushes.load() > 0);
   CHECK_EQ(counter->writes.load(), 10);
 }

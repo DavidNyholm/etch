@@ -11,8 +11,12 @@
 
 #include "agent.hpp"
 #include "async_sink.hpp"
+#include "context.hpp"
+#include "debugger_sink.hpp"
+#include "default_logger.hpp"
 #include "json.hpp"
 #include "level.hpp"
 #include "logger.hpp"
 #include "record.hpp"
+#include "sink_set.hpp"
 #include "sinks.hpp"

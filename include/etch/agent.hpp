@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "async_sink.hpp"
+#include "default_logger.hpp"
 #include "json.hpp"
 #include "level.hpp"
 #include "logger.hpp"

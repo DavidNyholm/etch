@@ -116,6 +116,19 @@ void section_levels_and_filters(etch::Logger& log) {
   log.set_level(etch::Level::kTrace);
   std::println("   compile-time floor ETCH_MIN_LEVEL = {} ({})", ETCH_MIN_LEVEL,
                etch::to_string(etch::kCompileTimeMinLevel));
+  // The same text ETCH_LEVEL takes, here from code: the default logger and the named loggers
+  // etch::get() hands out, by name, without a rebuild.
+  etch::apply_level_spec("warn,net=debug");
+  std::println("   after apply_level_spec(\"warn,net=debug\"): main is {}, net is {}",
+               etch::default_logger().get_level(), etch::get("net").get_level());
+  etch::apply_level_spec("info");
+
+  std::println("   every(1ms) and once(): one line per interval per call site, the rest counted:");
+  for (int i = 0; i < 6; ++i) {
+    if (i == 5) std::this_thread::sleep_for(std::chrono::milliseconds(2));  // the budget refills
+    log.every(std::chrono::milliseconds(1)).warn("hot loop, pass {}", i);
+  }
+  for (int i = 0; i < 3; ++i) log.once().info("said once, pass {}", i);
 }
 
 void section_file(const DemoArgs& args) {
@@ -180,6 +193,9 @@ void section_json(const DemoArgs& args) {
   }
   (*file)->set_style(etch::LineStyle{.format = etch::LineFormat::kJson});
   etch::Logger log{"json", {*file}};
+  // Context fields ride on every record this thread logs while `ctx` lives, so a program can
+  // group a run's lines by request or frame without with() on each call.
+  auto ctx = etch::context({{"frame", 1442}});
   log.with({{"fps", 41.7}, {"level_name", "forest"}, {"entities", 1204}})
       .warn("frame budget exceeded");
   const PacketHeader header;
@@ -233,6 +249,9 @@ void section_fatal(etch::Logger& log) {
 int main(int argc, char** argv) {
   const DemoArgs args = parse_args(argc, argv);
   etch::Logger log{"demo", {std::make_shared<etch::ConsoleSink>(stdout, args.colour)}};
+  // The same lines also reach a debugger's output window (Visual Studio, DebugView, x64dbg)
+  // when one is attached; nothing is written otherwise.
+  log.add_sink(std::make_shared<etch::DebuggerSink>());
 
   std::println("etch demo (C++23 logger). Lines look like:");
   std::println("  <time> <LEVEL> [<logger>] [<thread id>] <file>:<line>: <message>");
