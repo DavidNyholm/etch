@@ -2,7 +2,7 @@
 
 A small, header-only C++23 logger: `std::format` messages with file and line and no macros, a lock-free async queue, a colour console, rotating files, and JSON Lines with typed fields for programs and models to read. MSVC and GCC 14, standard library only. A hobby project built to try the C++23 library in anger, tested by building a game on it and by six review rounds from a second model.
 
-**Status:** v0.3.1 on `main`, verified on Windows (MSVC 2026 Insiders) and Linux (Ubuntu 24.04, GCC 14.2): 99 tests, 38 injected bugs all caught, zero warnings. Work in progress lives on `beta` (0.4.0: a lock-free sink list, context fields, `ETCH_LEVEL`, rate limiting, a debugger sink, benchmark percentiles). The [wiki](https://github.com/DavidNyholm/etch/wiki) has everything beyond this page.
+**Status:** v0.4.0 on `main`, verified on Windows (MSVC 2026 Insiders) and Linux (Ubuntu 24.04, GCC 14.2): 124 tests (one of them Windows-only), 51 injected bugs all caught, zero warnings. Day-to-day work happens on `beta`. The [wiki](https://github.com/DavidNyholm/etch/wiki) has everything beyond this page.
 
 ## Quick start
 
@@ -21,7 +21,7 @@ In your own project, straight from GitHub:
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(etch GIT_REPOSITORY https://github.com/DavidNyholm/etch.git GIT_TAG v0.3.1)
+FetchContent_Declare(etch GIT_REPOSITORY https://github.com/DavidNyholm/etch.git GIT_TAG v0.4.0)
 FetchContent_MakeAvailable(etch)
 target_link_libraries(app PRIVATE etch::etch)
 ```

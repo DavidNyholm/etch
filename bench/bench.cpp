@@ -47,11 +47,21 @@ void* operator new(std::size_t size) {
   if (void* p = std::malloc(size == 0 ? 1 : size)) return p;
   throw std::bad_alloc();
 }
+// GCC 14 inlines the replacement above at call sites and then sees std::free applied to memory
+// it believes came from operator new, so -Wmismatched-new-delete fires in Release builds. The
+// pairing is malloc/free on both sides; the warning is about provenance it cannot see.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 void* operator new[](std::size_t size) { return operator new(size); }
 void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 namespace {
 
