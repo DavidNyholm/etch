@@ -5,6 +5,8 @@
 #include <cstdlib>
 #else
 #include <stdlib.h>
+
+#include <sys/wait.h>  // WIFEXITED/WEXITSTATUS, to decode what std::system returns
 #endif
 
 namespace {
@@ -139,10 +141,17 @@ constexpr const char* kChildMarker = "ETCH_TEST_CHILD";
 int run_fresh_with_level(const char* level, const char* test_name) {
   set_environment(etch::kLevelEnvironmentVariable, level);
   set_environment(kChildMarker, "1");
-  // Doubly quoted: cmd.exe strips the outer pair, sh concatenates them; both then see the
-  // quoted path, which has a space in it on this project.
-  const std::string command = "\"\"" + test_executable() + "\" " + test_name + "\"";
+  // The path has a space in it on this project, so it is quoted. cmd.exe strips one outer pair
+  // of quotes from the whole line, so it gets a second pair; sh would merge that pair with the
+  // path into one program name, so it gets the plain form.
+  const std::string quoted = "\"" + test_executable() + "\" " + test_name;
+#if defined(_WIN32)
+  const std::string command = "\"" + quoted + "\"";
   const int code = std::system(command.c_str());
+#else
+  const int status = std::system(quoted.c_str());
+  const int code = WIFEXITED(status) ? WEXITSTATUS(status) : status;
+#endif
   set_environment(kChildMarker, "");
   set_environment(etch::kLevelEnvironmentVariable, "");
   return code;
