@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 
 project(etch
-  VERSION 0.3.0
+  VERSION 0.4.0
   DESCRIPTION "A small header-only C++23 logger"
   LANGUAGES CXX)
 

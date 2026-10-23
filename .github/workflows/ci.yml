@@ -1,0 +1,96 @@
+# Builds, tests and runs the demo on every push: MSVC on Windows, GCC 14 on Linux, both Debug
+# and Release. Clang with libc++ is tried but allowed to fail (Roadmap item 2). The injected-bug
+# run is a separate job because it rebuilds the tests once per bug.
+name: CI
+
+on:
+  push:
+    branches: [main, beta]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows, MSVC, ${{ matrix.config }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (the newest Visual Studio on the runner)
+        run: cmake -S . -B build/ci -A x64
+      - name: Build
+        run: cmake --build build/ci --config ${{ matrix.config }} --parallel
+      - name: Test
+        run: ctest --test-dir build/ci -C ${{ matrix.config }} --output-on-failure
+      - name: Demo
+        run: build\ci\${{ matrix.config }}\etch_demo.exe --no-colour --burst 500
+      - name: Benchmark
+        if: matrix.config == 'Release'
+        run: build\ci\Release\etch_bench.exe
+
+  linux:
+    name: Linux, GCC 14, ${{ matrix.config }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, Release]
+    env:
+      CC: gcc-14
+      CXX: g++-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build/ci -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+      - name: Build
+        run: cmake --build build/ci --parallel
+      - name: Test
+        run: ctest --test-dir build/ci --output-on-failure
+      - name: Demo
+        run: build/ci/etch_demo --no-colour --burst 500
+      - name: Benchmark
+        if: matrix.config == 'Release'
+        run: build/ci/etch_bench
+
+  clang-libcxx:
+    name: Linux, Clang 18 with libc++ (allowed to fail)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    env:
+      CC: clang-18
+      CXX: clang++-18
+      CXXFLAGS: -stdlib=libc++ -fexperimental-library
+      LDFLAGS: -stdlib=libc++
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libc++
+        run: sudo apt-get update && sudo apt-get install -y clang-18 libc++-18-dev libc++abi-18-dev
+      - name: Configure
+        run: cmake -S . -B build/ci -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build/ci --parallel
+      - name: Test
+        run: ctest --test-dir build/ci --output-on-failure
+
+  injected-bugs:
+    name: Injected bugs, Linux, GCC 14
+    runs-on: ubuntu-24.04
+    env:
+      CC: gcc-14
+      CXX: g++-14
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure and build the tests
+        run: |
+          cmake --preset linux
+          cmake --build --preset linux --target etch_tests
+      - name: Inject every bug and check the suite catches it
+        run: python3 tools/mutate.py --preset linux
