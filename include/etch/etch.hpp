@@ -10,10 +10,12 @@
 #pragma once
 
 #include "agent.hpp"
+#include "async_registry.hpp"
 #include "async_sink.hpp"
 #include "context.hpp"
 #include "debugger_sink.hpp"
 #include "default_logger.hpp"
+#include "delivery.hpp"
 #include "json.hpp"
 #include "level.hpp"
 #include "logger.hpp"

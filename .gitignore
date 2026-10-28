@@ -5,9 +5,10 @@ out/
 .vscode/
 CMakeUserPresets.json
 
-# Files the demo writes
+# Files the demo writes (a file sink leaves an empty <name>.lock beside its log)
 *.log
 *.log.[0-9]*
+*.lock
 
 # Local agent tooling, not part of the project
 .claude/

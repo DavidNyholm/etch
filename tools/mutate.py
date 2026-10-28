@@ -12,7 +12,9 @@ Needs the configure step to have been run for that preset (cmake --preset <name>
 from __future__ import annotations
 
 import argparse
+import os
 import platform
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -20,7 +22,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 INCLUDE = ROOT / "include" / "etch"
 
-# (file, description, [(text to find, replacement), ...]). Each replacement must match once.
+# (file, description, [(text to find, replacement), ...], {platforms}?). Each replacement
+# must match once. The optional set of platforms ("windows", "linux") limits a mutation to
+# the builds where its text exists; elsewhere it is skipped and not counted.
 MUTATIONS = [
     (
         "level.hpp",
@@ -100,12 +104,17 @@ MUTATIONS = [
     (
         "default_logger.hpp",
         "a named level is not applied to a logger made later",
-        [("    logger->set_level(it->second);\n", "")],
+        [
+            (
+                "    logger->set_level(it->second);  // asked for by name before it existed: its own level\n",
+                "",
+            ),
+        ],
     ),
     (
         "default_logger.hpp",
         "the root level of a spec is ignored",
-        [("if (spec.root) root.set_level", "if (false) root.set_level")],
+        [("    root.set_level(*spec.root, /*own=*/false);\n", "")],
     ),
     (
         "logger.hpp",
@@ -120,22 +129,34 @@ MUTATIONS = [
     (
         "logger.hpp",
         "the suppressed count is never reported",
-        [("if (suppressed > 0) {", "if (suppressed < 0) {")],
+        [
+            (
+                "if (!detail::admit_rate(where, interval_, once_, suppressed)) return false;\n"
+                "    if (suppressed > 0) {",
+                "if (!detail::admit_rate(where, interval_, once_, suppressed)) return false;\n"
+                "    if (suppressed < 0) {",
+            ),
+        ],
     ),
     (
         "logger.hpp",
         "a filtered scope uses up the rate budget",
         [
             (
-                "if (!active_ || !logger_.enabled(options.level) || !admit(where)) options.level",
-                "if (!active_ || !admit(where) || !logger_.enabled(options.level)) options.level",
+                "if (options.level != Level::kOff && rate_gated_) {",
+                "if (rate_gated_) {",
             ),
         ],
     ),
     (
         "logger.hpp",
         "a supplied suppressed field is kept next to the generated one",
-        [("      std::erase_if(owned_, [](const Field& f) { return f.key == kSuppressedField; });\n", "")],
+        [
+            (
+                "      std::erase_if(owned_, [](const Field& f) { return f.key == detail::kSuppressedField; });\n",
+                "",
+            ),
+        ],
     ),
     (
         "sinks.hpp",
@@ -181,21 +202,42 @@ MUTATIONS = [
         "async_sink.hpp",
         "dropped records are not counted",
         [
-            ("dropped_.fetch_add(1, std::memory_order_seq_cst);", ";"),
+            (
+                "        note_dropped(r);\n"
+                "        active_producers_.fetch_sub(1, std::memory_order_seq_cst);",
+                "        active_producers_.fetch_sub(1, std::memory_order_seq_cst);",
+            ),
         ],
     ),
     (
         "async_sink.hpp",
         "async ignores the inner sink's level",
-        [("if (inner_->accepts(r.level)) enqueue(std::move(r));", "enqueue(std::move(r));")],
+        [
+            (
+                "    if (!inner_->accepts(r.level)) return;\n"
+                "    if (detail::kept_from(r, this)) {\n"
+                "      count_reentry();\n"
+                "      return;\n"
+                "    }\n"
+                "    if (inherited()) {\n"
+                "      write_inner(std::move(r));",
+                "    if (detail::kept_from(r, this)) {\n"
+                "      count_reentry();\n"
+                "      return;\n"
+                "    }\n"
+                "    if (inherited()) {\n"
+                "      write_inner(std::move(r));",
+            ),
+        ],
     ),
     (
         "async_sink.hpp",
         "an exception from the inner sink is swallowed uncounted",
         [
             (
-                "  void write_inner(Record&& r) noexcept {\n    try {\n      inner_->write(std::move(r));\n    } catch (...) {\n      write_failures_.fetch_add(1, std::memory_order_relaxed);\n    }\n  }",
-                "  void write_inner(Record&& r) noexcept {\n    try {\n      inner_->write(std::move(r));\n    } catch (...) {\n    }\n  }",
+                "    try {\n      inner_->write(std::move(r));\n    } catch (...) {\n"
+                "      counters_->write_failures.fetch_add(1, std::memory_order_relaxed);\n    }",
+                "    try {\n      inner_->write(std::move(r));\n    } catch (...) {\n    }",
             ),
         ],
     ),
@@ -251,27 +293,32 @@ MUTATIONS = [
         "emit skips the level check",
         [
             (
-                "    if (!enabled(r.level)) return;\n    deliver(std::move(r));",
-                "    deliver(std::move(r));",
+                "    if (!enabled(r.level)) return;\n    r.lineage = nullptr;",
+                "    r.lineage = nullptr;",
             )
         ],
     ),
     (
         "async_sink.hpp",
         "drop policy drops errors as readily as trace",
-        [("policy_ == Overflow::kDrop && r.level < keep_from_", "policy_ == Overflow::kDrop")],
+        [
+            (
+                "      if (policy_ == Overflow::kDrop && r.level < keep_from_) {\n        note_dropped(r);",
+                "      if (policy_ == Overflow::kDrop) {\n        note_dropped(r);",
+            ),
+        ],
     ),
     (
         "async_sink.hpp",
         "no gap marker after dropped records",
-        [("      if (marker.level < Level::kOff) inner_->write(std::move(marker));", "      ;")],
+        [("      if (marker.level < Level::kOff) write_inner(std::move(marker));", "      ;")],
     ),
     (
         "async_sink.hpp",
         "late records are written before the ring drains at shutdown",
         [
             (
-                "        not_full_.wait(lock, [&] { return worker_gone_.load(std::memory_order_seq_cst); });",
+                "        sync_->not_full.wait(lock, [&] { return worker_gone_.load(std::memory_order_seq_cst); });",
                 "",
             )
         ],
@@ -297,7 +344,7 @@ MUTATIONS = [
     (
         "logger.hpp",
         "hexdump ignores its limit",
-        [("const std::size_t shown = std::min(size, limit);", "const std::size_t shown = size;")],
+        [("const std::size_t shown = (std::min)(size, limit);", "const std::size_t shown = size;")],
     ),
     (
         "sinks.hpp",
@@ -306,8 +353,9 @@ MUTATIONS = [
     ),
     (
         "sinks.hpp",
-        "a second FileSink on the same path is not refused",
-        [("if (!detail::open_paths().insert(key).second) {", "if (false) {")],
+        "an open file sink is never published to the exit handler",
+        [("      files.by_path[key].sink = sink;\n", "")],
+        {"linux"},
     ),
     (
         "sinks.hpp",
@@ -359,6 +407,166 @@ MUTATIONS = [
             )
         ],
     ),
+    (
+        "record.hpp",
+        "field keys with spaces and equals signs are written bare",
+        [
+            (
+                "c == '_' || c == '.' || c == '-';",
+                "c == '_' || c == '.' || c == '-' || c == '=' || c == ' ';",
+            ),
+        ],
+    ),
+    (
+        "record.hpp",
+        "bidirectional overrides pass through the text output",
+        [
+            (
+                "(candidate >= 0x202a && candidate <= 0x202e)",
+                "(candidate >= 0x202a && candidate < 0x202a)",
+            ),
+        ],
+    ),
+    (
+        "record.hpp",
+        "fields land after the appended dump and stack lines",
+        [
+            (
+                "  for (const auto& field : r.fields) {\n    out += ' ';\n"
+                "    append_field_text(field, out);\n  }\n  out += r.appended_text();",
+                "  out += r.appended_text();\n  for (const auto& field : r.fields) {\n"
+                "    out += ' ';\n    append_field_text(field, out);\n  }",
+            ),
+        ],
+    ),
+    (
+        "record.hpp",
+        "an enum with a formatter is logged as a number",
+        [("std::is_enum_v<U> && HasFormatter<U>", "std::is_enum_v<U> && false")],
+    ),
+    (
+        "delivery.hpp",
+        "a nested write skipped by the logger is not counted",
+        [("      sink->count_reentry();\n", "")],
+    ),
+    (
+        "async_sink.hpp",
+        "the async worker does not mark its sink as writing",
+        [("    const detail::WriteScope outer(this);\n", "")],
+    ),
+    (
+        "sinks.hpp",
+        "a file held by another process is not refused",
+        [
+            (
+                "_O_WRONLY | _O_CREAT | _O_NOINHERIT, _SH_DENYRW, _S_IWRITE);",
+                "_O_WRONLY | _O_CREAT | _O_NOINHERIT, _SH_DENYNO, _S_IWRITE);",
+            ),
+        ],
+        {"windows"},
+    ),
+    (
+        "sinks.hpp",
+        "a file held by another process is not refused",
+        [
+            (
+                "if (::flock(lock_fd_, LOCK_EX | LOCK_NB) != 0) {",
+                "if (::flock(lock_fd_, LOCK_SH | LOCK_NB) != 0) {",
+            ),
+        ],
+        {"linux"},
+    ),
+    (
+        "sinks.hpp",
+        "the exit handler does not flush the open file sinks",
+        [("    for (const auto& sink : live) sink->flush();\n", "")],
+        {"linux"},
+    ),
+    (
+        "logger.hpp",
+        "a rate-gated threshold scope spends the budget when it starts",
+        [
+            (
+                "options.min_duration > std::chrono::nanoseconds{0}",
+                "options.min_duration < std::chrono::nanoseconds{0}",
+            ),
+        ],
+    ),
+    (
+        "logger.hpp",
+        "with().every() does not rate-gate",
+        [
+            (
+                "    interval_ = interval;\n    once_ = false;\n    rate_gated_ = true;\n",
+                "    interval_ = interval;\n    once_ = false;\n",
+            ),
+        ],
+    ),
+    (
+        "default_logger.hpp",
+        "a bare level skips the loggers that already exist",
+        [
+            (
+                "    for (const auto& [name, logger] : registry.loggers) logger->inherit_level(*spec.root);\n",
+                "",
+            ),
+        ],
+    ),
+    (
+        "default_logger.hpp",
+        "*=level leaves the loggers their own levels",
+        [
+            (
+                "      logger->set_level(*spec.all, /*own=*/false);",
+                "      logger->set_level(*spec.all);",
+            ),
+        ],
+    ),
+    (
+        "default_logger.hpp",
+        "a spec naming an unknown logger is not reported",
+        [
+            (
+                "      if (!registry.loggers.empty()) {",
+                "      if (registry.loggers.empty()) {",
+            ),
+        ],
+    ),
+    (
+        "level.hpp",
+        "a logger name with a space or a star is accepted",
+        [
+            (
+                "return !name.empty() && name.find_first_of(kForbidden) == std::string_view::npos;",
+                "return !name.empty();",
+            ),
+        ],
+    ),
+    (
+        "agent.hpp",
+        "an edited agent profile style is ignored",
+        [
+            (
+                "  options.style = profile.style;  // the profile's style wins, so an edit to it is not lost\n",
+                "",
+            ),
+        ],
+    ),
+    (
+        "agent.hpp",
+        "the summary ignores the drops of the sinks it watches",
+        [("      dropped += counters->dropped.load(std::memory_order_relaxed);\n", "")],
+    ),
+    (
+        "agent.hpp",
+        "the summary file's directory is not created",
+        [
+            (
+                "      std::filesystem::create_directories(path.parent_path(), ec);  // the open reports failure\n",
+                "      (void)ec;\n",
+            ),
+        ],
+    ),
 ]
 
 
@@ -366,46 +574,125 @@ BUILD_TIMEOUT_S = 600  # a mutant must not hang the whole run on a broken build
 TEST_TIMEOUT_S = 120  # the suite takes about a second; a hang is a finding of its own
 
 
-def run(args: list[str], timeout: int, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+def kill_tree(process: subprocess.Popen[bytes]) -> None:
+    """Ends the process and everything it started: a hung test can have a child of its own
+    (the fresh-process probes, a forked child), which would otherwise outlive the timeout and
+    hold files and locks the next mutation runs into."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)], capture_output=True)
+    else:
+        os.killpg(process.pid, signal.SIGKILL)  # the process leads its own session (below)
+    process.kill()
 
 
-def build_and_test(build_args: list[str], binary: Path) -> tuple[str, list[str]]:
-    """Returns (status, failing test names). status: caught, MISSED, BUILD FAILED, TIMED OUT."""
+def run(args: list[str], timeout: int, cwd: Path = ROOT) -> subprocess.CompletedProcess[bytes]:
+    # Bytes, not text: a mutant can make the test binary print arbitrary bytes, which must not
+    # abort the whole run with a decoding error.
+    start_own_session = {} if os.name == "nt" else {"start_new_session": True}
+    with subprocess.Popen(
+        args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **start_own_session
+    ) as process:
+        try:
+            out, err = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_tree(process)
+            out, err = process.communicate()
+            raise subprocess.TimeoutExpired(args, timeout, output=out, stderr=err) from None
+    return subprocess.CompletedProcess(args, process.returncode, out, err)
+
+
+def failing_tests(output: str | bytes | None) -> list[str]:
+    """The tests the binary reported as failed, plus one entry for an assertion that failed in a
+    test that never finished (the binary hung or died inside it)."""
+    if output is None:
+        return []
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", "replace")
+    names: list[str] = []
+    assertion_pending = False
+    for line in output.splitlines():
+        if line.startswith("    FAILED"):
+            assertion_pending = True
+        elif line.startswith("  FAIL"):
+            names.append(line.split(maxsplit=1)[1])
+            assertion_pending = False
+        elif line.startswith("  ok"):
+            assertion_pending = False
+    if assertion_pending:
+        names.append("(an assertion in a test that did not finish)")
+    return names
+
+
+def build_and_test(build_args: list[str], binary: Path) -> tuple[str, list[str], str]:
+    """Returns (status, failing test names, note). status: caught, MISSED, BUILD FAILED, TIMED OUT.
+
+    A binary that reports failures and then hangs counts as caught: the mutant was found, and
+    a later test not finishing is one more symptom of it, not a miss.
+    """
     try:
         build = run(build_args, BUILD_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        return "TIMED OUT", []
+        return "TIMED OUT", [], ""
     if build.returncode != 0:
-        return "BUILD FAILED", []
+        return "BUILD FAILED", [], ""
     try:
         test = run([str(binary)], TEST_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        return "TIMED OUT", []
-    failing = [line.split(maxsplit=1)[1] for line in test.stdout.splitlines() if line.startswith("  FAIL")]
-    return ("caught" if test.returncode != 0 else "MISSED"), failing
+    except subprocess.TimeoutExpired as hang:
+        failing = failing_tests(hang.stdout)
+        if failing:
+            return "caught", failing, "(the binary then hung)"
+        return "TIMED OUT", [], ""
+    return ("caught" if test.returncode != 0 else "MISSED"), failing_tests(test.stdout), ""
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     default_preset = "windows" if platform.system() == "Windows" else "linux"
     parser.add_argument("--preset", default=default_preset)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="only verify that every mutation's text is found exactly once; build nothing",
+    )
+    parser.add_argument(
+        "--only",
+        default="",
+        help="run only the mutations whose description contains this text",
+    )
     opts = parser.parse_args()
-    build_dir = ROOT / "build" / opts.preset
-    binary = build_dir / ("Debug/etch_tests.exe" if opts.preset == "windows" else "etch_tests")
+    # The build presets map onto the configure presets' directories: "windows-release" builds
+    # the Release configuration in the "windows" (Visual Studio, multi-config) directory; the
+    # Ninja and Linux presets are single-config directories of their own.
+    on_windows = opts.preset.startswith("windows")
+    platform_name = "windows" if on_windows else "linux"
+    configure_preset = "windows" if opts.preset in ("windows", "windows-release") else opts.preset
+    build_dir = ROOT / "build" / configure_preset
     build_args = ["cmake", "--build", str(build_dir), "--target", "etch_tests"]
-    if opts.preset == "windows":
-        build_args += ["--config", "Debug"]
+    if opts.preset in ("windows", "windows-release"):
+        configuration = "Release" if opts.preset == "windows-release" else "Debug"
+        build_args += ["--config", configuration]
+        binary = build_dir / configuration / "etch_tests.exe"
+    elif on_windows:
+        binary = build_dir / "etch_tests.exe"
+    else:
+        binary = build_dir / "etch_tests"
 
-    # Baseline gate: a suite that already fails would "catch" every mutant for the wrong reason.
-    status, failing = build_and_test(build_args, binary)
-    if status != "MISSED":
-        print(f"baseline is not green ({status} {', '.join(failing)}); fix that first")
-        return 2
-    print("baseline: all tests pass")
+    if not opts.check:
+        # Baseline gate: a suite that already fails would "catch" every mutant for the wrong
+        # reason.
+        status, failing, _ = build_and_test(build_args, binary)
+        if status != "MISSED":
+            print(f"baseline is not green ({status} {', '.join(failing)}); fix that first")
+            return 2
+        print("baseline: all tests pass")
 
     results = []
-    for file_name, description, edits in MUTATIONS:
+    for entry in MUTATIONS:
+        file_name, description, edits, *only = entry
+        if only and platform_name not in only[0]:
+            continue  # a mutation of another platform's code
+        if opts.only and opts.only not in description:
+            continue
         path = INCLUDE / file_name
         original = path.read_text(encoding="utf-8")
         mutated = original
@@ -419,12 +706,16 @@ def main() -> int:
             results.append(("NOT APPLIED", description, []))
             print(f"NOT APPLIED  {description}  (the text to mutate was not found exactly once)")
             continue
+        if opts.check:
+            results.append(("caught", description, []))
+            print(f"applies      {description}")
+            continue
         path.write_text(mutated, encoding="utf-8", newline="\n")
         try:
-            status, failing = build_and_test(build_args, binary)
+            status, failing, note = build_and_test(build_args, binary)
             results.append((status, description, failing))
             if failing:
-                detail = ", ".join(failing)
+                detail = ", ".join(failing) + (" " + note if note else "")
             elif status == "caught":
                 detail = "(the test binary crashed)"
             elif status == "MISSED":
@@ -434,6 +725,11 @@ def main() -> int:
             print(f"{status:<12} {description}  {detail}")
         finally:
             path.write_text(original, encoding="utf-8", newline="\n")
+
+    if opts.check:
+        not_applied = sum(1 for r in results if r[0] == "NOT APPLIED")
+        print(f"\n{len(results) - not_applied} of {len(results)} mutations apply")
+        return 0 if not_applied == 0 else 1
 
     # Leave the build matching the restored sources, and say so if that fails.
     restored = run(build_args, BUILD_TIMEOUT_S)

@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "context.hpp"
+#include "delivery.hpp"
 #include "level.hpp"
 #include "record.hpp"
 #include "sink_set.hpp"
@@ -80,7 +81,7 @@ inline std::string format_hexdump(std::string_view label, const void* data, std:
   if (label_length != nullptr) *label_length = out.size();
   if (null_data) return out;
   const auto* bytes = static_cast<const unsigned char*>(data);
-  const std::size_t shown = std::min(size, limit);
+  const std::size_t shown = (std::min)(size, limit);  // (std::min): <windows.h> may follow etch
   auto app = std::back_inserter(out);
   const int offset_digits = shown >= kWideOffsetFrom ? 8 : 4;
   for (std::size_t offset = 0; offset < shown; offset += kBytesPerLine) {
@@ -152,6 +153,18 @@ inline bool same_path_prefix(std::string_view path, std::string_view prefix) noe
 
 class SinkSet;
 
+// The count of held-back calls rides on the line that gets through, as a field of this name,
+// replacing any field of that name the caller supplied.
+inline constexpr std::string_view kSuppressedField = "suppressed";
+
+// A rate gate carried by a scope timer with a threshold: decided at the end, by the scopes
+// that turned out slow (see Logger::Entry::scope).
+struct RateGate {
+  std::chrono::nanoseconds interval{0};
+  bool once = false;
+  bool gated = false;
+};
+
 }  // namespace detail
 
 class Logger;
@@ -171,7 +184,7 @@ struct ScopeOptions {
 class ScopeTimer {
  public:
   ScopeTimer(Logger& logger, ScopeOptions options, std::string what, std::source_location where,
-             Fields fields = {});
+             Fields fields = {}, detail::RateGate gate = {});
   ~ScopeTimer();
   ScopeTimer(const ScopeTimer&) = delete;
   ScopeTimer& operator=(const ScopeTimer&) = delete;
@@ -186,6 +199,7 @@ class ScopeTimer {
   std::string what_;
   std::source_location where_;
   Fields fields_;
+  detail::RateGate gate_;
   bool active_;
   std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
 };
@@ -262,7 +276,7 @@ class Logger {
       : name_(std::move(other.name_)),
         sinks_(std::move(other.sinks_)),
         options_(other.options_),
-        level_(other.level_.load(std::memory_order_relaxed)) {}
+        level_state_(other.level_state_.load(std::memory_order_relaxed)) {}
   Logger(const Logger&) = delete;
   Logger& operator=(const Logger&) = delete;
   Logger& operator=(Logger&&) = delete;
@@ -281,8 +295,29 @@ class Logger {
   void set_sinks(SinkList sinks) { sinks_->set(std::move(sinks)); }
   SinkList sinks() const { return *sinks_->snapshot(); }
 
-  void set_level(Level level) noexcept { level_.store(level, std::memory_order_relaxed); }
-  Level get_level() const noexcept { return level_.load(std::memory_order_relaxed); }
+  // A level set here is the logger's own: a bare level in a later level spec ("warn" from
+  // ETCH_LEVEL or apply_level_spec) leaves it alone, where a logger that only inherited its
+  // level from the default logger follows. own = false is what "*=level" uses: it sets the
+  // level and gives the ownership up, so the next bare level reaches the logger again.
+  void set_level(Level level, bool own = true) noexcept {
+    level_state_.store(pack_level(level, own), std::memory_order_relaxed);
+  }
+  // A level handed down by a bare level spec: taken unless the logger has a level of its own,
+  // decided and applied in one atomic step, so a set_level() racing with it is never half
+  // overwritten.
+  void inherit_level(Level level) noexcept {
+    std::uint16_t state = level_state_.load(std::memory_order_relaxed);
+    while ((state & kOwnLevelBit) == 0 &&
+           !level_state_.compare_exchange_weak(state, pack_level(level, /*own=*/false),
+                                               std::memory_order_relaxed)) {
+    }
+  }
+  Level get_level() const noexcept {
+    return static_cast<Level>(level_state_.load(std::memory_order_relaxed) & kLevelMask);
+  }
+  bool has_own_level() const noexcept {
+    return (level_state_.load(std::memory_order_relaxed) & kOwnLevelBit) != 0;
+  }
   // kOff is a setting, never a record level: nothing is logged "at off".
   bool enabled(Level level) const noexcept {
     return level < Level::kOff && level >= kCompileTimeMinLevel && level >= get_level();
@@ -403,6 +438,20 @@ class Logger {
   // time, thread and logger name.
   void emit(Record r) {
     if (!enabled(r.level)) return;
+    r.lineage = nullptr;  // a record handed in from outside (a replay) starts a chain of its own
+    deliver(std::move(r));
+  }
+
+  // etch's own word about its configuration (a level spec that could not be applied): skips
+  // this logger's level, because the configuration being diagnosed may be what set it to off,
+  // and is still subject to each sink's level. Not for application messages.
+  template <class... Args>
+  void report(Level level, FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) {
+    if (level >= Level::kOff) return;
+    Record r;
+    r.level = level;
+    r.where = fmt.where;
+    r.message = std::vformat(fmt.format.get(), std::make_format_args(args...));
     deliver(std::move(r));
   }
 
@@ -412,27 +461,21 @@ class Logger {
   // Stamps and delivers without the level check: for a scope timer's end line, whose level was
   // checked when the scope began.
   void deliver(Record r) {
-    const Level level = r.level;
     r.time = std::chrono::system_clock::now();
     r.thread = std::this_thread::get_id();
     r.thread_index = detail::this_thread_index();
     r.logger_name = name_;
     detail::append_context(r.fields);
-    if (level == Level::kFatal && options_.stacktrace_on_fatal) append_stacktrace(r);
+    if (r.level == Level::kFatal && options_.stacktrace_on_fatal) append_stacktrace(r);
+    // Logged from inside a sink's write: delivered once that write has returned (see Sink).
+    // The locked snapshot is fine here; this is the rare path. Should nothing be able to hold
+    // it, it is delivered now, to every sink but the ones it must not reach.
+    if (detail::WriteScope::any()) {
+      if (detail::defer(sinks_->snapshot(), r)) return;
+      r.lineage = detail::current_lineage();
+    }
     const detail::SinkSet::Use use(*sinks_);
-    const SinkList& sinks = use.list();
-    // Every sink but the last gets a copy; the last takes the record itself, so the common
-    // single-sink setup never copies the message.
-    Sink* last = nullptr;
-    for (const auto& sink : sinks) {
-      if (!sink->accepts(level)) continue;
-      if (last != nullptr) last->write(r);
-      last = sink.get();
-    }
-    if (last != nullptr) last->write(std::move(r));
-    if (level == Level::kFatal) {
-      for (const auto& sink : sinks) sink->flush();
-    }
+    detail::deliver_to(use.list(), std::move(r));
   }
 
  public:
@@ -444,14 +487,24 @@ class Logger {
     r.message = format_hexdump(label, data, size, limit, &r.message_user_length);
     if (data != nullptr) {
       const auto* first = static_cast<const std::byte*>(data);
-      r.bytes.assign(first, first + std::min(size, limit));
+      r.bytes.assign(first, first + (std::min)(size, limit));
     }
     return r;
   }
 
  private:
   Logger(std::string name, std::shared_ptr<detail::SinkSet> sinks, Level level, Options options)
-      : name_(std::move(name)), sinks_(std::move(sinks)), options_(options), level_(level) {}
+      : name_(std::move(name)),
+        sinks_(std::move(sinks)),
+        options_(options),
+        level_state_(pack_level(level, /*own=*/false)) {}
+
+  // The level and whether it is the logger's own, in one word: see set_level.
+  static constexpr std::uint16_t kLevelMask = 0xff;
+  static constexpr std::uint16_t kOwnLevelBit = 0x100;
+  static constexpr std::uint16_t pack_level(Level level, bool own) noexcept {
+    return static_cast<std::uint16_t>(static_cast<std::uint16_t>(level) | (own ? kOwnLevelBit : 0));
+  }
 
   // Appends the frames to the message for people and keeps them as data for the JSON output.
   // Frames inside etch's own headers are left out, whatever the compiler inlined, by looking at
@@ -487,16 +540,17 @@ class Logger {
   std::string name_;
   std::shared_ptr<detail::SinkSet> sinks_;
   Options options_;
-  std::atomic<Level> level_{Level::kTrace};
+  std::atomic<std::uint16_t> level_state_{pack_level(Level::kTrace, /*own=*/false)};
 };
 
 inline ScopeTimer::ScopeTimer(Logger& logger, ScopeOptions options, std::string what,
-                              std::source_location where, Fields fields)
+                              std::source_location where, Fields fields, detail::RateGate gate)
     : logger_(logger),
       options_(options),
       what_(std::move(what)),
       where_(where),
       fields_(std::move(fields)),
+      gate_(gate),
       active_(logger.enabled(options.level)) {
   if (active_ && options_.begin) {
     Record r;
@@ -513,6 +567,14 @@ inline ScopeTimer::~ScopeTimer() {
   try {
     const auto took = elapsed();
     if (took < options_.min_duration) return;
+    if (gate_.gated) {  // a rate-gated threshold scope: the slow ones spend the budget
+      std::uint64_t suppressed = 0;
+      if (!detail::admit_rate(where_, gate_.interval, gate_.once, suppressed)) return;
+      if (suppressed > 0) {
+        std::erase_if(fields_, [](const Field& f) { return f.key == detail::kSuppressedField; });
+        fields_.emplace_back(detail::kSuppressedField, suppressed);
+      }
+    }
     Record r;
     r.level = options_.level;
     r.where = where_;
@@ -552,6 +614,19 @@ class Logger::Entry {
   Entry&& with(Fields fields) && {
     owned_.insert(owned_.end(), std::make_move_iterator(fields.begin()),
                   std::make_move_iterator(fields.end()));
+    return std::move(*this);
+  }
+  // The other order: log.with({{"fps", fps}}).every(1s).warn("slow") means the same.
+  Entry&& every(std::chrono::nanoseconds interval) && {
+    interval_ = interval;
+    once_ = false;
+    rate_gated_ = true;
+    return std::move(*this);
+  }
+  Entry&& once() && {
+    interval_ = std::chrono::nanoseconds{0};
+    once_ = true;
+    rate_gated_ = true;
     return std::move(*this);
   }
 
@@ -619,28 +694,43 @@ class Logger::Entry {
     std::move(*this).hexdump(level, label, std::ranges::data(range), bytes, limit, where);
   }
 
-  // A scope timer whose begin and end lines carry the fields.
+  // A scope timer whose begin and end lines carry the fields. Rate-gated with a threshold,
+  // log.every(1min).scope("frame", {.min_duration = 16ms}), the gate is decided at the end and
+  // only by the scopes that passed the threshold, so "the slow frames, at most once a minute"
+  // means that; such a scope writes no begin line, since the decision is not known yet.
   [[nodiscard]] ScopeTimer scope(std::string_view what, ScopeOptions options = ScopeOptions{},
                                  std::source_location where = std::source_location::current()) && {
     // Level first, so a filtered scope costs nothing and does not use up the budget.
-    if (!active_ || !logger_.enabled(options.level) || !admit(where)) options.level = Level::kOff;
-    return ScopeTimer(logger_, options, std::string(what), where, take());
+    if (!active_ || !logger_.enabled(options.level)) options.level = Level::kOff;
+    detail::RateGate gate;
+    if (options.level != Level::kOff && rate_gated_) {
+      if (options.min_duration > std::chrono::nanoseconds{0}) {
+        gate = detail::RateGate{.interval = interval_, .once = once_, .gated = true};
+        options.begin = false;
+      } else if (!admit(where)) {
+        options.level = Level::kOff;
+      }
+    }
+    return ScopeTimer(logger_, options, std::string(what), where, take(), gate);
+  }
+  [[nodiscard]] ScopeTimer scope(std::string_view what, Level level,
+                                 std::source_location where = std::source_location::current()) && {
+    return std::move(*this).scope(what, ScopeOptions{.level = level}, where);
   }
 
  private:
   Fields take() { return std::move(owned_); }
 
   // The rate gate, after the level check so a filtered call costs nothing and is not counted.
-  // When the call goes through after others were held back, the count rides on it as a field,
-  // replacing any field of that name the caller supplied.
-  static constexpr std::string_view kSuppressedField = "suppressed";
+  // When the call goes through after others were held back, the count rides on it as the
+  // `suppressed` field, replacing any field of that name the caller supplied.
   bool admit(const std::source_location& where) {
     if (!rate_gated_) return true;
     std::uint64_t suppressed = 0;
     if (!detail::admit_rate(where, interval_, once_, suppressed)) return false;
     if (suppressed > 0) {
-      std::erase_if(owned_, [](const Field& f) { return f.key == kSuppressedField; });
-      owned_.emplace_back(kSuppressedField, suppressed);
+      std::erase_if(owned_, [](const Field& f) { return f.key == detail::kSuppressedField; });
+      owned_.emplace_back(detail::kSuppressedField, suppressed);
     }
     return true;
   }

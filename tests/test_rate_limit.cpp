@@ -14,6 +14,51 @@ std::optional<std::int64_t> suppressed_field(const etch::Record& r) {
   return std::nullopt;
 }
 
+TEST(a_rate_gated_scope_with_a_threshold_is_decided_by_the_slow_scopes) {
+  Captured c;
+  // The same call site: one fast scope, then two slow ones. The fast one must not spend the
+  // budget, and there is no begin line to spend it on; the first slow one is the one reported.
+  constexpr auto kThreshold = 100ms;  // far above what a descheduled fast scope could reach
+  constexpr auto kSlow = 150ms;
+  for (int i = 0; i < 3; ++i) {
+    auto scope = c.log.once().scope(std::format("frame {}", i),
+                                    {.level = etch::Level::kWarn, .min_duration = kThreshold});
+    if (i > 0) std::this_thread::sleep_for(kSlow);
+  }
+  const auto records = c.sink->records();
+  CHECK_EQ(records.size(), 1u);
+  if (records.empty()) return;
+  // The first slow scope: frame 1, unless the machine stalled frame 0 past the threshold,
+  // which the duration check then still accepts.
+  CHECK(records[0].message.starts_with("frame "));
+  CHECK(records[0].duration.has_value() && *records[0].duration >= kThreshold);
+  CHECK(!suppressed_field(records[0]));
+}
+
+TEST(with_then_every_means_the_same_as_every_then_with) {
+  Captured c;
+  for (int i = 0; i < 3; ++i) c.log.with({{"k", i}}).every(1h).warn("w {}", i);
+  for (int i = 0; i < 3; ++i) c.log.with({{"k", i}}).once().warn("o {}", i);
+  CHECK_EQ(c.messages(), (std::vector<std::string>{"w 0", "o 0"}));
+  for (const auto& r : c.sink->records()) {
+    CHECK_EQ(r.fields.size(), 1u);
+    CHECK(!r.fields.empty() && r.fields[0].key == "k");
+  }
+}
+
+TEST(an_entry_takes_a_scope_level_like_the_logger_does) {
+  Captured c;
+  {
+    auto scope = c.log.with({{"k", 1}}).scope("load", etch::Level::kWarn);
+  }
+  const auto records = c.sink->records();
+  CHECK_EQ(records.size(), 2u);
+  if (records.size() < 2) return;
+  CHECK_EQ(records[0].message, std::string("load: begin"));
+  CHECK(records[1].message.starts_with("load: done in"));
+  CHECK(records[0].fields.size() == 1 && records[1].fields.size() == 1);
+}
+
 TEST(once_logs_the_first_call_only_per_call_site) {
   Captured c;
   for (int i = 0; i < 5; ++i) c.log.once().warn("first site {}", i);

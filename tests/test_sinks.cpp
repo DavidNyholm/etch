@@ -19,6 +19,218 @@ TEST(memory_sink_keeps_the_last_n) {
   CHECK_EQ(sink->total(), 0u);
 }
 
+// Child probe: tries a truncating open of a FileSink on the path the parent holds, and expects
+// what ETCH_TEST_EXPECT says ("refused" or "opened").
+TEST(zz_child_probe_file_held_by_another_process) {
+  if (!in_child()) return;
+  const std::string path(etch::detail::env("ETCH_TEST_HELD_PATH"));
+  const auto second = etch::FileSink::open(path, {.truncate = true});
+  if (etch::detail::env("ETCH_TEST_EXPECT") == "refused") {
+    CHECK(!second.has_value());
+    CHECK(!second.has_value() && second.error() == std::errc::device_or_resource_busy);
+  } else {
+    CHECK(second.has_value());
+  }
+}
+
+TEST(a_file_held_by_another_process_is_refused_untouched_until_it_is_released) {
+  const auto path = scratch_dir() / "held.log";
+  const std::string path_text = path.string();
+  auto file = etch::FileSink::open(path, {.truncate = true});
+  CHECK(file.has_value());
+  if (!file) return;
+  CHECK((*file)->holds_lock());
+  CHECK(std::filesystem::exists(scratch_dir() / "held.log.lock"));
+  {
+    etch::Logger log{"held", {*file}};  // scoped: a logger keeps its sinks alive
+    log.warn("kept");
+  }
+  (*file)->flush();
+  const auto before = read_bytes(path);
+  CHECK(before.size() > 1);
+  // The other process asks for a truncating open: refused, and the file is untouched.
+  CHECK_EQ(run_test_in_child(
+               "zz_child_probe_file_held_by_another_process",
+               {{"ETCH_TEST_HELD_PATH", path_text.c_str()}, {"ETCH_TEST_EXPECT", "refused"}}),
+           0);
+  CHECK(read_bytes(path) == before);
+  file->reset();
+  CHECK_EQ(run_test_in_child(
+               "zz_child_probe_file_held_by_another_process",
+               {{"ETCH_TEST_HELD_PATH", path_text.c_str()}, {"ETCH_TEST_EXPECT", "opened"}}),
+           0);
+  CHECK_EQ(std::filesystem::file_size(path), 0u);  // the other process truncated it this time
+}
+
+#if !defined(_WIN32)
+TEST(a_file_reached_through_a_symlink_is_the_same_file_to_the_lock) {
+  const auto real = scratch_dir() / "real.log";
+  const auto alias = scratch_dir() / "alias.log";
+  auto first = etch::FileSink::open(real, {.truncate = true});
+  CHECK(first.has_value());
+  if (!first) return;
+  std::error_code ec;
+  std::filesystem::create_symlink(real, alias, ec);
+  CHECK(!ec);
+  if (ec) return;
+  const auto second = etch::FileSink::open(alias, {.truncate = true});
+  CHECK(!second.has_value() && second.error() == std::errc::device_or_resource_busy);
+  CHECK((*first)->path() == std::filesystem::weakly_canonical(real));
+  CHECK_EQ(std::filesystem::file_size(real), 0u);  // nothing was written to it
+}
+
+TEST(a_symlink_to_a_file_not_made_yet_is_the_same_file_to_the_lock) {
+  const auto real = scratch_dir() / "dangling-real.log";
+  const auto alias = scratch_dir() / "dangling-alias.log";
+  std::error_code ec;
+  std::filesystem::create_symlink(real, alias, ec);  // points at nothing yet
+  CHECK(!ec);
+  if (ec) return;
+  auto through_alias = etch::FileSink::open(alias, {.truncate = true});
+  CHECK(through_alias.has_value());
+  if (!through_alias) return;
+  CHECK((*through_alias)->path() == std::filesystem::weakly_canonical(real));
+  etch::Logger log{"dangling", {*through_alias}};
+  log.warn("kept");
+  (*through_alias)->flush();
+  // The real name now: the same file, so refused, and its line untouched.
+  const auto by_real_name = etch::FileSink::open(real, {.truncate = true});
+  CHECK(!by_real_name.has_value() && by_real_name.error() == std::errc::device_or_resource_busy);
+  CHECK_EQ(read_lines(real).size(), 1u);
+}
+#endif
+
+#if !defined(_WIN32)
+TEST(a_symlink_chain_too_long_to_follow_is_refused_rather_than_locked_halfway) {
+  constexpr int kLinks = 40;  // past the resolver's limit
+  const auto real = scratch_dir() / "chain-real.log";
+  std::filesystem::path next = real;
+  std::error_code ec;
+  for (int i = kLinks - 1; i >= 0 && !ec; --i) {
+    const auto link = scratch_dir() / std::format("chain-{}.log", i);
+    std::filesystem::create_symlink(next, link, ec);
+    next = link;
+  }
+  CHECK(!ec);
+  if (ec) return;
+  const auto sink = etch::FileSink::open(next, {.truncate = true});  // chain-0 -> ... -> real
+  CHECK(!sink.has_value() && sink.error() == std::errc::too_many_symbolic_link_levels);
+  CHECK(!std::filesystem::exists(real));  // nothing was made along the way
+}
+#endif
+
+TEST(a_log_named_like_a_lock_file_is_refused) {
+  const auto refused = etch::FileSink::open(scratch_dir() / "not-a-log.lock");
+  CHECK(!refused.has_value() && refused.error() == std::errc::invalid_argument);
+#if defined(_WIN32)
+  const auto other_case = etch::FileSink::open(scratch_dir() / "not-a-log.LOCK");
+  CHECK(!other_case.has_value() && other_case.error() == std::errc::invalid_argument);
+#endif
+}
+
+TEST(rotation_does_not_move_over_a_file_another_sink_holds_as_its_log) {
+  const auto path = scratch_dir() / "rotating.log";
+  auto rotated_into = scratch_dir() / "rotating.log";
+  rotated_into += ".1";
+  constexpr std::uintmax_t kMaxBytes = 120;
+  auto first =
+      etch::FileSink::open(path, {.max_bytes = kMaxBytes, .max_files = 1, .truncate = true});
+  auto second = etch::FileSink::open(rotated_into, {.truncate = true});
+  CHECK(first.has_value() && second.has_value());
+  if (!first || !second) return;
+  {
+    etch::Logger other{"other", {*second}};
+    other.warn("the other sink's line");
+    (*second)->flush();
+    etch::Logger log{"rot", {*first}};
+    for (int i = 0; i < 20; ++i) log.warn("line {} is long enough to need a rotation soon", i);
+    (*first)->flush();
+  }
+  // No rotation happened (the destination was held), the first sink kept appending, and the
+  // second sink's file is still its own, with its line.
+  CHECK_EQ((*first)->rotations(), 0u);
+  CHECK(std::filesystem::file_size(path) > kMaxBytes);
+  CHECK_EQ(read_lines(rotated_into).size(), 1u);
+  CHECK((*first)->write_failures() > 0);  // each refused attempt is counted, like a failed rename
+}
+
+// Child probe: rotates a log whose ".1" the parent holds as its own live log, from another
+// process, and expects the rotation to be refused there.
+TEST(zz_child_probe_rotation_into_a_file_another_process_holds) {
+  if (!in_child()) return;
+  const std::string path(etch::detail::env("ETCH_TEST_ROTATE_PATH"));
+  constexpr std::uintmax_t kMaxBytes = 120;
+  auto file =
+      etch::FileSink::open(path, {.max_bytes = kMaxBytes, .max_files = 1, .truncate = true});
+  CHECK(file.has_value());
+  if (!file) return;
+  etch::Logger log{"rot", {*file}};
+  for (int i = 0; i < 20; ++i) log.warn("line {} is long enough to need a rotation soon", i);
+  (*file)->flush();
+  CHECK_EQ((*file)->rotations(), 0u);
+  CHECK((*file)->write_failures() > 0);
+}
+
+TEST(rotation_does_not_move_over_a_file_another_process_holds_as_its_log) {
+  const auto path = scratch_dir() / "rotating-across.log";
+  auto rotated_into = scratch_dir() / "rotating-across.log";
+  rotated_into += ".1";
+  auto held = etch::FileSink::open(rotated_into, {.truncate = true});
+  CHECK(held.has_value());
+  if (!held) return;
+  {
+    etch::Logger other{"other", {*held}};
+    other.warn("the other process's line");
+  }
+  (*held)->flush();
+  const std::string path_text = path.string();
+  CHECK_EQ(run_test_in_child("zz_child_probe_rotation_into_a_file_another_process_holds",
+                             {{"ETCH_TEST_ROTATE_PATH", path_text.c_str()}}),
+           0);
+  CHECK_EQ(read_lines(rotated_into).size(), 1u);  // still this process's file, with its line
+}
+
+TEST(a_relative_path_whose_directory_does_not_exist_yet_is_resolved_against_the_cwd_at_open) {
+  const auto previous = std::filesystem::current_path();
+  std::filesystem::current_path(scratch_dir());
+  auto file = etch::FileSink::open("rel-logs/app.log", {.truncate = true});
+  std::filesystem::current_path(previous);  // whatever happened, the process cwd is restored
+  CHECK(file.has_value());
+  if (!file) return;
+  CHECK((*file)->path().is_absolute());
+  CHECK((*file)->path() ==
+        std::filesystem::weakly_canonical(scratch_dir() / "rel-logs" / "app.log"));
+  etch::Logger log{"rel", {*file}};
+  log.warn("after the cwd changed back");  // lands in the scratch directory, not in `previous`
+  (*file)->flush();
+  CHECK_EQ(read_lines(scratch_dir() / "rel-logs" / "app.log").size(), 1u);
+}
+
+// Child probe: a file sink held by a local that std::exit() skips. The exit handler flushes it.
+TEST(zz_child_probe_exit_with_a_local_file_sink) {
+  if (!in_child()) return;
+  const std::string path(etch::detail::env("ETCH_TEST_EXIT_PATH"));
+  auto file = etch::FileSink::open(path, {.flush_on = etch::Level::kOff, .truncate = true});
+  CHECK(file.has_value());
+  if (!file) std::exit(3);
+  etch::Logger log{"exit", {*file}};
+  log.warn("written before exit");  // buffered: nothing flushes it but the exit handler
+  std::error_code ec;
+  std::filesystem::remove_all(scratch_dir(), ec);  // main() will not get to do it
+  std::exit(0);
+}
+
+TEST(a_file_sink_skipped_by_exit_is_flushed_by_the_exit_handler) {
+  const auto path = scratch_dir() / "exit.log";
+  const std::string path_text = path.string();
+  CHECK_EQ(run_test_in_child("zz_child_probe_exit_with_a_local_file_sink",
+                             {{"ETCH_TEST_EXIT_PATH", path_text.c_str()}}),
+           0);
+  const auto lines = read_lines(path);
+  CHECK_EQ(lines.size(), 1u);
+  CHECK(!lines.empty() && lines[0].ends_with("written before exit"));
+}
+
 TEST(callback_sink_receives_records) {
   std::vector<std::string> seen;
   auto sink = std::make_shared<etch::CallbackSink>([&](const etch::Record& r) {

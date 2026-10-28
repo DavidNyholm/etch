@@ -100,14 +100,31 @@ constexpr std::optional<Level> parse_level(std::string_view text) noexcept {
 }
 
 // Levels from text such as "warn,net=debug,render=trace": an entry without a name is the level
-// for the default logger (and so the starting level of every etch::get() logger made later),
-// "name=level" is the level for the etch::get() logger of that name. Entries are separated by
-// commas or semicolons; names and levels are trimmed; an empty entry is skipped. This is what
-// the ETCH_LEVEL environment variable holds; see etch::apply_level_spec in logger.hpp.
+// for the default logger and for every etch::get() logger that the spec does not name (now and
+// when made later); "name=level" is the level for the etch::get() logger of that name, which
+// then keeps it through later bare levels; "*=level" sets every logger and forgets the named
+// levels. Entries are separated by commas or semicolons; names and levels are trimmed; an
+// empty entry is skipped. This is what the ETCH_LEVEL environment variable holds; see
+// etch::apply_level_spec in default_logger.hpp.
 struct LevelSpec {
   std::optional<Level> root;
   std::vector<std::pair<std::string, Level>> loggers;
+  std::optional<Level> all;  // "*=level"; last, so {root, {names}} initialisation still works
 };
+
+namespace detail {
+
+// The whitespace trimmed around a spec's entries, names and levels.
+inline constexpr std::string_view kSpecWhitespace = " \t\r\n\f\v";
+
+// A logger name in a spec: anything but whitespace, '=', '*' and the separators, so that
+// "my net=debug" or "net*=debug" is reported rather than stored under a name no logger has.
+constexpr bool is_logger_name(std::string_view name) noexcept {
+  constexpr std::string_view kForbidden = " \t\r\n\f\v=*,;";
+  return !name.empty() && name.find_first_of(kForbidden) == std::string_view::npos;
+}
+
+}  // namespace detail
 
 // The spec, or a message naming the entry that could not be read.
 inline std::expected<LevelSpec, std::string> parse_level_spec(std::string_view text) {
@@ -117,11 +134,10 @@ inline std::expected<LevelSpec, std::string> parse_level_spec(std::string_view t
     std::string_view entry = text.substr(0, end);
     text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
     const auto trim = [](std::string_view s) {
-      constexpr std::string_view kWhitespace = " \t\r\n";
-      while (!s.empty() && kWhitespace.find(s.front()) != std::string_view::npos) {
+      while (!s.empty() && detail::kSpecWhitespace.find(s.front()) != std::string_view::npos) {
         s.remove_prefix(1);
       }
-      while (!s.empty() && kWhitespace.find(s.back()) != std::string_view::npos) {
+      while (!s.empty() && detail::kSpecWhitespace.find(s.back()) != std::string_view::npos) {
         s.remove_suffix(1);
       }
       return s;
@@ -143,6 +159,10 @@ inline std::expected<LevelSpec, std::string> parse_level_spec(std::string_view t
     }
     if (name.empty()) {
       spec.root = *level;
+    } else if (name == "*") {
+      spec.all = *level;
+    } else if (!detail::is_logger_name(name)) {
+      return std::unexpected(std::format("'{}' is not a logger name", name));
     } else {
       spec.loggers.emplace_back(std::string(name), *level);
     }

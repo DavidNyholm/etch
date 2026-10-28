@@ -11,10 +11,67 @@ TEST(agent_profile_is_compact_json_with_drops_above_warn_kept) {
   CHECK(p.style.json.time == etch::JsonStyle::Time::kEpochMillis);
   CHECK(!p.style.json.thread && !p.style.json.pid && !p.style.json.path && !p.style.json.function);
   CHECK(p.file.style.format == etch::LineFormat::kJson);
-  CHECK(!p.scope.begin);
   CHECK(p.overflow == etch::AsyncSink::Overflow::kDrop);
   CHECK(p.keep_from == etch::Level::kWarn);
-  CHECK(p.hexdump_limit < etch::kDefaultHexdumpLimit);
+}
+
+TEST(an_edit_to_the_agent_profile_style_reaches_the_file) {
+  const auto path = scratch_dir() / "agent-style.jsonl";
+  auto profile = etch::agent_profile();
+  profile.style.json.thread = true;
+  auto agent = etch::open_agent_log(path, profile);
+  CHECK(agent.has_value());
+  if (!agent) return;
+  {
+    etch::Logger log{"agent", {*agent}};
+    log.warn("hello");
+    (*agent)->flush();
+  }
+  const auto lines = read_lines(path);
+  CHECK_EQ(lines.size(), 1u);
+  CHECK(!lines.empty() && lines[0].find("\"thread\":") != std::string::npos);
+}
+
+// Blocks every write until released, so a ring in front of it fills up.
+struct HeldSink final : etch::Sink {
+  std::atomic<bool> released{false};
+  void write(const etch::Record&) override {
+    while (!released.load()) std::this_thread::sleep_for(1ms);
+  }
+};
+
+// The number after "dropped": in a summary object.
+std::size_t dropped_in(const std::string& json) {
+  const auto key = json.find("\"dropped\":");
+  if (key == std::string::npos) return static_cast<std::size_t>(-1);
+  return static_cast<std::size_t>(std::stoull(json.substr(key + 10)));
+}
+
+TEST(the_summary_keeps_the_drops_of_a_sink_that_is_gone) {
+  auto summary = std::make_shared<etch::SummarySink>();
+  std::size_t dropped_while_alive = 0;
+  {
+    auto held = std::make_shared<HeldSink>();
+    auto async = std::make_shared<etch::AsyncSink>(held, 2, etch::AsyncSink::Overflow::kDrop,
+                                                   etch::Level::kFatal);
+    summary->watch(async);
+    etch::Logger log{"dropper", {async}};
+    for (int i = 0; i < 50; ++i) log.warn("flood {}", i);  // below keep_from: dropped when full
+    held->released = true;
+    async->flush();
+    dropped_while_alive = async->dropped();
+    CHECK(dropped_while_alive > 0);
+  }
+  // The sink is gone (a log reopened under load does this) and nothing read the summary while
+  // it lived; its drops are still there, in full.
+  CHECK_EQ(dropped_in(summary->json()), dropped_while_alive);
+}
+
+TEST(write_to_makes_the_summary_directory) {
+  etch::SummarySink summary;
+  const auto path = scratch_dir() / "nested" / "dir" / "summary.json";
+  CHECK(!summary.write_to(path));
+  CHECK(std::filesystem::exists(path));
 }
 
 TEST(open_agent_log_writes_compact_json_lines) {

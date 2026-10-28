@@ -15,6 +15,7 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "level.hpp"
 #include "logger.hpp"
@@ -39,13 +40,13 @@ inline constexpr const char* kLevelEnvironmentVariable = "ETCH_LEVEL";
 
 namespace detail {
 
-// The named loggers, and the levels ETCH_LEVEL or apply_level_spec() asked for by name, kept
-// so a logger made later under that name starts at its level. Never destroyed: loggers are
-// used from static destructors.
+// The named loggers, and the levels ETCH_LEVEL or apply_level_spec() asked for by name before
+// the logger existed, so one made later under that name starts at that level as its own.
+// Never destroyed: loggers are used from static destructors.
 struct LoggerRegistry {
   std::mutex mutex;
   std::map<std::string, std::unique_ptr<Logger>, std::less<>> loggers;
-  std::map<std::string, Level, std::less<>> levels;
+  std::map<std::string, Level, std::less<>> levels;  // for loggers not made yet
 };
 inline LoggerRegistry& logger_registry() {
   static LoggerRegistry* const registry = new LoggerRegistry;
@@ -54,27 +55,61 @@ inline LoggerRegistry& logger_registry() {
 
 // Applies a spec given the root logger, so it can run while default_logger() is still being
 // initialised (the public apply_level_spec() calls default_logger(), which would re-enter that
-// initialisation). Takes the registry lock, so the caller must not hold it.
-inline void apply_level_spec_to(Logger& root, const LevelSpec& spec) {
-  if (spec.root) root.set_level(*spec.root);
+// initialisation). Takes the registry lock, so the caller must not hold it. A bare level
+// reaches the loggers that have no level of their own (see Logger::set_level); "*" reaches all
+// of them and takes their own levels away. A name that matches no logger made so far is stored
+// for when one is made, and reported on the root logger when `warn_unknown` is set and other
+// loggers already exist: at start-up, before any subsystem has logged, every name is unknown
+// and silence is right; from a console command in a running program, a typo should say so.
+// The report goes out before the spec is applied, so a spec cannot silence its own diagnosis.
+inline void apply_level_spec_to(Logger& root, const LevelSpec& spec, bool warn_unknown) {
   LoggerRegistry& registry = logger_registry();
+  if (warn_unknown) {
+    std::vector<std::pair<std::string, Level>> unknown;
+    {
+      std::lock_guard lock(registry.mutex);
+      if (!registry.loggers.empty()) {
+        for (const auto& [name, level] : spec.loggers) {
+          if (!registry.loggers.contains(name)) unknown.emplace_back(name, level);
+        }
+      }
+    }
+    for (const auto& [name, level] : unknown) {
+      root.report(
+          Level::kWarn,
+          "etch: level spec names logger '{}', which does not exist yet (see etch::loggers()); "
+          "it will start at {} if it is made",
+          name, level_name(level));
+    }
+  }
   std::lock_guard lock(registry.mutex);
+  if (spec.all) {
+    registry.levels.clear();
+    root.set_level(*spec.all, /*own=*/false);
+    for (const auto& [name, logger] : registry.loggers) {
+      logger->set_level(*spec.all, /*own=*/false);
+    }
+  } else if (spec.root) {
+    root.set_level(*spec.root, /*own=*/false);
+    for (const auto& [name, logger] : registry.loggers) logger->inherit_level(*spec.root);
+  }
   for (const auto& [name, level] : spec.loggers) {
-    registry.levels.insert_or_assign(name, level);
     if (const auto it = registry.loggers.find(name); it != registry.loggers.end()) {
       it->second->set_level(level);
+    } else {
+      registry.levels.insert_or_assign(name, level);
     }
   }
 }
 
 // Parses and applies text; a bad value is reported on the root logger and nothing is applied.
-inline bool apply_level_text_to(Logger& root, std::string_view text) {
+inline bool apply_level_text_to(Logger& root, std::string_view text, bool warn_unknown) {
   const std::expected<LevelSpec, std::string> spec = parse_level_spec(text);
   if (!spec) {
-    root.warn("etch: level spec '{}' ignored: {}", text, spec.error());
+    root.report(Level::kWarn, "etch: level spec '{}' ignored: {}", text, spec.error());
     return false;
   }
-  apply_level_spec_to(root, *spec);
+  apply_level_spec_to(root, *spec, warn_unknown);
   return true;
 }
 
@@ -94,7 +129,7 @@ inline Logger& default_logger() {
       }
     });
     const std::string_view text = detail::env(kLevelEnvironmentVariable);
-    if (!text.empty()) detail::apply_level_text_to(*logger, text);
+    if (!text.empty()) detail::apply_level_text_to(*logger, text, /*warn_unknown=*/false);
     return logger;
   }();
   return *instance;
@@ -112,25 +147,39 @@ inline Logger& get(std::string_view name) {
   }
   auto logger = std::make_unique<Logger>(root.child(std::string(name)));
   if (const auto it = registry.levels.find(name); it != registry.levels.end()) {
-    logger->set_level(it->second);
+    logger->set_level(it->second);  // asked for by name before it existed: its own level
+    registry.levels.erase(it);
   }
   Logger& ref = *logger;
   registry.loggers.emplace(std::string(name), std::move(logger));
   return ref;
 }
 
-// Sets levels from a spec: the root level on the default logger, each named level on that
-// etch::get() logger, now if it exists and when it is first made otherwise. A level set this
-// way is a plain set_level(): a later set_level() call replaces it.
+// The names of the etch::get() loggers made so far, in order. For a console command that
+// lists what "/log name=level" can name.
+inline std::vector<std::string> loggers() {
+  detail::LoggerRegistry& registry = detail::logger_registry();
+  std::lock_guard lock(registry.mutex);
+  std::vector<std::string> names;
+  names.reserve(registry.loggers.size());
+  for (const auto& [name, logger] : registry.loggers) names.push_back(name);
+  return names;
+}
+
+// Sets levels from a spec (see LevelSpec): a bare level on the default logger and on every
+// etch::get() logger that has no level of its own (one never given a level by name, in a spec
+// or by set_level); each named level on that logger, as its own, now if it exists and when it
+// is first made otherwise; "*=level" on every logger, taking their own levels away. A name that
+// matches no logger yet, while others exist, is reported on the default logger.
 inline void apply_level_spec(const LevelSpec& spec) {
-  detail::apply_level_spec_to(default_logger(), spec);
+  detail::apply_level_spec_to(default_logger(), spec, /*warn_unknown=*/true);
 }
 
 // Parses and applies "warn,net=debug" text, such as a --log-level argument. An entry that is
-// not a level is reported on the default logger and the whole text is ignored, so a typo turns
-// one subsystem's silence into a warning rather than a surprise.
+// not a level, or not a logger name, is reported on the default logger and the whole text is
+// ignored, so a typo turns one subsystem's silence into a warning rather than a surprise.
 inline bool apply_level_spec(std::string_view text) {
-  return detail::apply_level_text_to(default_logger(), text);
+  return detail::apply_level_text_to(default_logger(), text, /*warn_unknown=*/true);
 }
 
 // Reads ETCH_LEVEL and applies it; false when the variable is empty or unset. The first use of

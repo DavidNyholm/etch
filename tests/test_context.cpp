@@ -1,27 +1,7 @@
 // Tests: context fields (per-thread, scoped) and levels from a spec or the environment.
 #include "support.hpp"
 
-#if defined(_WIN32)
-#include <cstdlib>
-#else
-#include <stdlib.h>
-
-#include <sys/wait.h>  // WIFEXITED/WEXITSTATUS, to decode what std::system returns
-#endif
-
 namespace {
-
-void set_environment(const char* name, const char* value) {
-#if defined(_WIN32)
-  _putenv_s(name, value);
-#else
-  if (std::string_view(value).empty()) {
-    unsetenv(name);
-  } else {
-    setenv(name, value, 1);
-  }
-#endif
-}
 
 using Pair = std::pair<std::string, etch::FieldValue>;
 std::vector<Pair> pairs(const etch::Fields& fields) {
@@ -137,26 +117,9 @@ TEST(a_bad_level_spec_is_reported_and_ignored) {
 
 // Runs one test of this binary in a fresh process with ETCH_LEVEL set, so the first use of
 // the default logger (or of get()) happens with the variable in force. Returns the exit code.
-constexpr const char* kChildMarker = "ETCH_TEST_CHILD";
 int run_fresh_with_level(const char* level, const char* test_name) {
-  set_environment(etch::kLevelEnvironmentVariable, level);
-  set_environment(kChildMarker, "1");
-  // The path has a space in it on this project, so it is quoted. cmd.exe strips one outer pair
-  // of quotes from the whole line, so it gets a second pair; sh would merge that pair with the
-  // path into one program name, so it gets the plain form.
-  const std::string quoted = "\"" + test_executable() + "\" " + test_name;
-#if defined(_WIN32)
-  const std::string command = "\"" + quoted + "\"";
-  const int code = std::system(command.c_str());
-#else
-  const int status = std::system(quoted.c_str());
-  const int code = WIFEXITED(status) ? WEXITSTATUS(status) : status;
-#endif
-  set_environment(kChildMarker, "");
-  set_environment(etch::kLevelEnvironmentVariable, "");
-  return code;
+  return run_test_in_child(test_name, {{etch::kLevelEnvironmentVariable, level}});
 }
-bool in_child() { return !etch::detail::env(kChildMarker).empty(); }
 
 // The probes below do their checks in the child only, where nothing has touched the default
 // logger before them; in a normal run they pass vacuously.
@@ -176,10 +139,6 @@ TEST(zz_child_probe_bad_value) {
 }
 
 TEST(environment_levels_apply_on_the_very_first_use) {
-  if (test_executable().empty()) {
-    CHECK(false && "test executable path unknown");
-    return;
-  }
   CHECK_EQ(run_fresh_with_level("warn,net=debug", "zz_child_probe_default_logger_first"), 0);
   CHECK_EQ(run_fresh_with_level("warn,net=debug", "zz_child_probe_get_first"), 0);
   CHECK_EQ(run_fresh_with_level("warn,net=loud", "zz_child_probe_bad_value"), 0);
@@ -193,6 +152,89 @@ TEST(levels_come_from_the_environment_variable) {
   set_environment(etch::kLevelEnvironmentVariable, "");
   CHECK(!etch::apply_levels_from_environment());
   etch::default_logger().set_level(previous);
+}
+
+// ---- what a level spec reaches ------------------------------------------------------------
+
+TEST(a_bare_level_reaches_existing_loggers_without_a_level_of_their_own) {
+  const etch::Level previous = etch::default_logger().get_level();
+  etch::Logger& plain = etch::get("spec-plain");
+  etch::Logger& named = etch::get("spec-named");
+  CHECK(etch::apply_level_spec("spec-named=debug"));
+  CHECK(etch::apply_level_spec("warn"));
+  CHECK(etch::default_logger().get_level() == etch::Level::kWarn);
+  CHECK(plain.get_level() == etch::Level::kWarn);   // followed the bare level
+  CHECK(named.get_level() == etch::Level::kDebug);  // kept its own
+  CHECK_EQ(etch::to_string(etch::get("spec-made-after").get_level()), std::string_view("WARN"));
+  // "*=level" sets every logger and forgets the named levels.
+  CHECK(etch::apply_level_spec("*=error"));
+  CHECK(named.get_level() == etch::Level::kError);
+  CHECK(plain.get_level() == etch::Level::kError);
+  CHECK(etch::default_logger().get_level() == etch::Level::kError);
+  CHECK(etch::apply_level_spec("info"));
+  CHECK(named.get_level() == etch::Level::kInfo);  // no longer its own
+  etch::LevelSpec restore;
+  restore.all = previous;
+  etch::apply_level_spec(restore);
+}
+
+TEST(a_level_set_by_hand_is_the_loggers_own_and_a_bare_spec_leaves_it_alone) {
+  const etch::Level previous = etch::default_logger().get_level();
+  etch::Logger& own = etch::get("spec-own");
+  CHECK(!own.has_own_level());  // inherited from the default logger
+  own.set_level(etch::Level::kDebug);
+  CHECK(own.has_own_level());
+  CHECK(etch::apply_level_spec("error"));
+  CHECK(own.get_level() == etch::Level::kDebug);
+  CHECK(etch::apply_level_spec("*=info"));  // takes the own levels away
+  CHECK(own.get_level() == etch::Level::kInfo && !own.has_own_level());
+  CHECK(etch::apply_level_spec("warn"));
+  CHECK(own.get_level() == etch::Level::kWarn);
+  etch::LevelSpec restore;
+  restore.all = previous;
+  etch::apply_level_spec(restore);
+}
+
+TEST(loggers_lists_the_names_made_so_far_and_a_bad_name_is_rejected) {
+  etch::get("spec-listed");
+  const auto names = etch::loggers();
+  CHECK(std::find(names.begin(), names.end(), "spec-listed") != names.end());
+  CHECK(!etch::parse_level_spec("my net=debug"));
+  CHECK(!etch::parse_level_spec("my\vnet=debug"));
+  CHECK(!etch::parse_level_spec("net*=debug"));
+  // The 0.4 aggregate form, {root, {names}}, must still compile and mean the same: the new
+  // member comes last. GCC's -Wextra warns about the member left out; that is the point here.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#endif
+  const etch::LevelSpec aggregate{etch::Level::kWarn, {{"net", etch::Level::kDebug}}};
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+  CHECK(aggregate.root == etch::Level::kWarn && aggregate.loggers.size() == 1);
+  const auto star = etch::parse_level_spec("*=debug");
+  CHECK(star && star->all == etch::Level::kDebug && !star->root);
+  const etch::Level previous = etch::get("spec-listed").get_level();
+  CHECK(!etch::apply_level_spec("net*=debug,spec-listed=fatal"));  // reported, nothing applied
+  CHECK(etch::get("spec-listed").get_level() == previous);
+}
+
+TEST(a_spec_naming_a_logger_that_does_not_exist_yet_is_reported_and_remembered) {
+  const auto previous_sinks = etch::default_logger().sinks();
+  const etch::Level previous = etch::default_logger().get_level();
+  // Muted: etch's word about a spec must still come out, since the spec may be what muted it.
+  etch::default_logger().set_level(etch::Level::kOff);
+  Captured c;
+  etch::default_logger().set_sinks({c.sink});
+  etch::get("spec-exists");
+  CHECK(etch::apply_level_spec("spec-missing=error"));
+  etch::default_logger().set_sinks(previous_sinks);
+  etch::default_logger().set_level(previous);
+  const auto messages = c.messages();
+  CHECK_EQ(messages.size(), 1u);
+  CHECK(!messages.empty() && messages[0].find("'spec-missing'") != std::string::npos);
+  CHECK(etch::get("spec-missing").get_level() == etch::Level::kError);  // remembered
 }
 
 }  // namespace

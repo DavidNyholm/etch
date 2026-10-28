@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <expected>
 #include <filesystem>
@@ -34,9 +35,14 @@
 namespace etch {
 
 // The settings for a log a program will read: JSON Lines with epoch-millisecond timestamps and
-// without the thread, pid, path and function fields; begin lines left off scope timers; small
-// hexdumps; the drop policy with warnings and above kept. Same code as every other log, only
-// the defaults differ, so a human-readable console and an agent file can share one logger.
+// without the thread, pid, path and function fields; the drop policy with warnings and above
+// kept. Same code as every other log, only the defaults differ, so a human-readable console
+// and an agent file can share one logger. `style` is what open_agent_log() gives the file:
+// edit it (p.style.json.thread = true) and the file follows; `file.style` is only there for a
+// program that passes `file` to FileSink::open itself. Two things the profile cannot set for
+// you, because they belong to the call, not the sink: a small hexdump limit (a model rarely
+// needs more than the first 256 bytes; pass it to hexdump()) and scopes without begin lines
+// (ScopeOptions{.begin = false}).
 struct AgentProfile {
   LineStyle style{.format = LineFormat::kJson,
                   .json = JsonStyle{.time = JsonStyle::Time::kEpochMillis,
@@ -45,11 +51,14 @@ struct AgentProfile {
                                     .path = false,
                                     .function = false}};
   FileSinkOptions file{.flush_on = Level::kWarn, .style = style};
-  ScopeOptions scope{.level = Level::kDebug, .begin = false};
-  std::size_t hexdump_limit = 256;  // the first 16 lines; a model rarely needs more
   AsyncSink::Overflow overflow = AsyncSink::Overflow::kDrop;
   Level keep_from = Level::kWarn;
   std::size_t queue_capacity = AsyncSink::kDefaultCapacity;
+  // Kept so that 0.4 code setting them still compiles; nothing in etch has ever read them
+  // (not marked deprecated: GCC would then warn on every copy of a profile). They are advice:
+  // pass the limit to hexdump() and the options to scope() yourself.
+  ScopeOptions scope{.level = Level::kDebug, .begin = false};
+  std::size_t hexdump_limit = 256;
 };
 
 inline AgentProfile agent_profile() { return AgentProfile{}; }
@@ -59,7 +68,9 @@ inline AgentProfile agent_profile() { return AgentProfile{}; }
 // above, and marks every gap. Returns the async sink; attach it to a logger.
 [[nodiscard]] inline std::expected<std::shared_ptr<AsyncSink>, std::error_code> open_agent_log(
     const std::filesystem::path& path, AgentProfile profile = agent_profile()) {
-  auto file = FileSink::open(path, profile.file);
+  FileSinkOptions options = profile.file;
+  options.style = profile.style;  // the profile's style wins, so an edit to it is not lost
+  auto file = FileSink::open(path, std::move(options));
   if (!file) return std::unexpected(file.error());
   return std::make_shared<AsyncSink>(std::move(*file), profile.queue_capacity, profile.overflow,
                                      profile.keep_from);
@@ -100,15 +111,32 @@ class SummarySink final : public Sink {
     }
   }
 
-  // Sinks whose own counters belong in the summary. Held weakly: a sink that is gone by the
-  // time the summary is written simply contributes nothing.
+  // Sinks whose own counters belong in the summary. What is kept is the sink's counters, which
+  // the sink shares and which outlive it, so a sink that is gone by the time the summary is
+  // written (a log reopened under load replaces its sinks) still counts in full.
   void watch(const std::shared_ptr<AsyncSink>& sink) {
+    if (sink == nullptr) return;  // nothing to count
     std::lock_guard lock(mutex_);
-    async_sinks_.push_back(sink);
+    watched_.push_back(sink->counters());
   }
   void watch(const std::shared_ptr<FileSink>& sink) {
+    if (sink == nullptr) return;
     std::lock_guard lock(mutex_);
-    file_sinks_.push_back(sink);
+    watched_.push_back(sink->counters());
+    watched_files_.push_back(sink);  // flushed before the final summary, so its failures count
+  }
+
+  // Flushes the watched file sinks that are still alive, so a failure in their last flush is
+  // in the counters before the summary is written. The installed summary does this at exit.
+  void flush_watched() {
+    std::vector<std::weak_ptr<FileSink>> files;
+    {
+      std::lock_guard lock(mutex_);
+      files = watched_files_;
+    }
+    for (const auto& weak : files) {
+      if (const auto file = weak.lock()) file->flush();
+    }
   }
 
   std::size_t total() const {
@@ -158,14 +186,9 @@ class SummarySink final : public Sink {
     out += '}';
     std::size_t dropped = 0;
     std::size_t failures = 0;
-    for (const auto& weak : async_sinks_) {
-      if (const auto sink = weak.lock()) {
-        dropped += sink->dropped();
-        failures += sink->write_failures();
-      }
-    }
-    for (const auto& weak : file_sinks_) {
-      if (const auto sink = weak.lock()) failures += sink->write_failures();
+    for (const auto& counters : watched_) {
+      dropped += counters->dropped.load(std::memory_order_relaxed);
+      failures += counters->write_failures.load(std::memory_order_relaxed);
     }
     std::format_to(app, ",\"dropped\":{},\"write_failures\":{}", dropped, failures);
     append_error(",\"first_error\":", first_error_, out);
@@ -174,8 +197,14 @@ class SummarySink final : public Sink {
     return out;
   }
 
-  // Writes the object and a newline to the file (replacing it). Returns the OS error if any.
+  // Writes the object and a newline to the file (replacing it), making missing parent
+  // directories like FileSink does. Returns the OS error if any.
   std::error_code write_to(const std::filesystem::path& path) const {
+    if (path.has_parent_path()) {
+      std::error_code ec;
+      std::filesystem::create_directories(path.parent_path(), ec);  // the open reports failure
+    }
+    errno = 0;
     std::ofstream out(path, std::ios::out | std::ios::binary | std::ios::trunc);
     if (!out.is_open()) return std::error_code(errno != 0 ? errno : EIO, std::generic_category());
     out << json() << '\n';
@@ -199,6 +228,8 @@ class SummarySink final : public Sink {
     std::lock_guard lock(slot.mutex);
     slot.sink = summary;
     slot.path = std::move(path);
+    detail::install_fork_handler();  // the generation below must move in a child
+    slot.fork_generation = detail::fork_generation().load(std::memory_order_relaxed);
     if (!slot.handler_registered) {
       slot.handler_registered = true;
       // Registered after the async exit handler would be if any async sink exists already, so
@@ -208,8 +239,23 @@ class SummarySink final : public Sink {
         auto& s = installed();
         std::lock_guard l(s.mutex);
         if (s.sink == nullptr) return;
+        // The child of a fork inherits this handler and the path: the summary is the parent's
+        // run, so the child leaves it alone (it installs its own if it wants one).
+        if (s.fork_generation != detail::fork_generation().load(std::memory_order_relaxed)) {
+          return;
+        }
         flush_all();
-        (void)s.sink->write_to(s.path);  // nowhere left to report a failure at exit
+        s.sink->flush_watched();
+        if (const auto ec = s.sink->write_to(s.path)) {
+          // No logger left to report to: stderr is the one place a failure at exit can go,
+          // best effort, because nothing may throw out of an exit handler.
+          try {
+            std::fprintf(stderr, "etch: could not write the run summary to %s: %s\n",
+                         utf8(s.path).c_str(), ec.message().c_str());
+          } catch (...) {
+            // Even the message could not be built: nothing left to do.
+          }
+        }
       });
     }
     return summary;
@@ -220,6 +266,7 @@ class SummarySink final : public Sink {
     std::mutex mutex;
     std::shared_ptr<SummarySink> sink;
     std::filesystem::path path;
+    unsigned fork_generation = 0;  // the process the summary belongs to
     bool handler_registered = false;
   };
   // Never destroyed: the exit handler reads it after statics may be gone.
@@ -252,8 +299,8 @@ class SummarySink final : public Sink {
   std::map<std::string, std::size_t, std::less<>> by_logger_;
   std::optional<ErrorSeen> first_error_;
   std::optional<ErrorSeen> last_error_;
-  std::vector<std::weak_ptr<AsyncSink>> async_sinks_;
-  std::vector<std::weak_ptr<FileSink>> file_sinks_;
+  std::vector<std::shared_ptr<const detail::SinkCounters>> watched_;
+  std::vector<std::weak_ptr<FileSink>> watched_files_;
   mutable std::mutex mutex_;
 };
 

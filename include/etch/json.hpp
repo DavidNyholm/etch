@@ -42,36 +42,7 @@ inline int process_id() noexcept {
 #endif
 }
 
-// Length of the UTF-8 sequence starting at text[i] if it is well formed, else 0. Checks the
-// lead byte, the continuation bytes, overlong forms, surrogates and the U+10FFFF ceiling.
-inline std::size_t utf8_sequence_length(std::string_view text, std::size_t i) noexcept {
-  const auto byte = [&](std::size_t k) { return static_cast<unsigned char>(text[k]); };
-  const unsigned char lead = byte(i);
-  std::size_t length = 0;
-  unsigned char second_min = 0x80;
-  unsigned char second_max = 0xbf;
-  if (lead < 0x80) return 1;
-  if (lead >= 0xc2 && lead <= 0xdf) {
-    length = 2;
-  } else if (lead >= 0xe0 && lead <= 0xef) {
-    length = 3;
-    if (lead == 0xe0) second_min = 0xa0;  // no overlong three-byte forms
-    if (lead == 0xed) second_max = 0x9f;  // no UTF-16 surrogates
-  } else if (lead >= 0xf0 && lead <= 0xf4) {
-    length = 4;
-    if (lead == 0xf0) second_min = 0x90;  // no overlong four-byte forms
-    if (lead == 0xf4) second_max = 0x8f;  // nothing past U+10FFFF
-  } else {
-    return 0;
-  }
-  if (i + length > text.size()) return 0;
-  const unsigned char second = byte(i + 1);
-  if (second < second_min || second > second_max) return 0;
-  for (std::size_t k = 2; k < length; ++k) {
-    if ((byte(i + k) & 0xc0) != 0x80) return 0;
-  }
-  return length;
-}
+// utf8_sequence_length lives in record.hpp, shared with the text escaper.
 
 inline void append_replacement_character(std::string& out) {
   out += '\\';

@@ -18,6 +18,66 @@ TEST(line_layout_is_exact) {
   CHECK_EQ(etch::format_line(r, bare), std::string("INFO  hello"));
 }
 
+TEST(field_keys_that_could_pose_as_structure_are_quoted) {
+  auto r = fixed_record();
+  r.fields = {{"ok_key.1-a", 1}, {"with space", 2}, {"a=b", 3}, {"new\nline", 4}, {"", 5}};
+  const etch::LineStyle bare{.time = false, .thread = false, .name = false, .location = false};
+  CHECK_EQ(etch::format_line(r, bare),
+           std::string("INFO  hello ok_key.1-a=1 \"with space\"=2 \"a=b\"=3 \"new\\nline\"=4 "
+                       "\"\"=5"));
+}
+
+TEST(unicode_controls_are_escaped_in_messages_and_values) {
+  auto r = fixed_record();
+  // U+202E (right-to-left override), U+009B (C1 escape introducer), then ordinary UTF-8.
+  r.message =
+      "abc\xe2\x80\xae"
+      "def \xc2\x9b"
+      "[31m Z\xc3\xbcrich";
+  r.fields = {{"v",
+               "x\xe2\x81\xa6"
+               "y"}};  // U+2066 (left-to-right isolate)
+  const etch::LineStyle bare{.time = false, .thread = false, .name = false, .location = false};
+  CHECK_EQ(etch::format_line(r, bare),
+           std::string("INFO  abc\\u202edef \\u009b[31m Z\xc3\xbcrich v=\"x\\u2066y\""));
+}
+
+TEST(malformed_utf8_is_escaped_byte_by_byte_and_line_separators_are_escaped) {
+  auto r = fixed_record();
+  // The lead byte of U+202E followed by two ASCII bytes is not a character: the stray byte is
+  // escaped on its own, nothing is invented from it, and the ASCII stays. A raw 0x9b is the
+  // eight-bit form of the escape-sequence introducer: escaped too, never passed through.
+  r.message =
+      "a\xe2"
+      "@nb \x9b"
+      "2J";
+  // U+2028 is escaped (a Unicode-aware reader breaks the line at it); ordinary UTF-8 stays.
+  r.fields = {{"v",
+               "x\xe2\x80\xa8"
+               "y Z\xc3\xbcrich"}};
+  const etch::LineStyle bare{.time = false, .thread = false, .name = false, .location = false};
+  CHECK_EQ(etch::format_line(r, bare), std::string("INFO  a\\xe2@nb \\x9b"
+                                                   "2J v=\"x\\u2028y Z\xc3\xbcrich\""));
+}
+
+TEST(a_logger_name_made_of_data_cannot_forge_a_record_or_drive_the_terminal) {
+  auto r = fixed_record();
+  r.logger_name = "net] [999] fake.cpp:1: x\n2026-01-01 00:00:00.000 ERROR [forged] \\n\x1b[2J";
+  const etch::LineStyle bare{.time = false, .thread = false, .location = false};
+  CHECK_EQ(etch::format_line(r, bare),
+           std::string("INFO  [net\\] [999\\] fake.cpp:1: x\\n2026-01-01 00:00:00.000 ERROR "
+                       "[forged\\] \\\\n\\e[2J] hello"));
+}
+
+TEST(fields_sit_on_the_record_line_before_appended_text) {
+  auto r = fixed_record();
+  r.message = "label\n  appended by etch";
+  r.message_user_length = 5;
+  r.fields = {{"k", 2}};
+  const etch::LineStyle bare{.time = false, .thread = false, .name = false, .location = false};
+  CHECK_EQ(etch::format_line(r, bare), std::string("INFO  label k=2\n  appended by etch"));
+}
+
 TEST(thread_column_is_the_small_thread_number) {
   auto r = fixed_record();
   r.thread_index = 42;

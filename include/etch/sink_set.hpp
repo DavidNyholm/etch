@@ -16,8 +16,6 @@
 
 namespace etch {
 
-using SinkList = std::vector<std::shared_ptr<Sink>>;
-
 namespace detail {
 
 // The sink list a logger and its children share. The list itself is an immutable snapshot,

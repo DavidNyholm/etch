@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 
 project(etch
-  VERSION 0.4.0
+  VERSION 0.5.0
   DESCRIPTION "A small header-only C++23 logger"
   LANGUAGES CXX)
 
@@ -108,7 +108,11 @@ if(ETCH_BUILD_TESTS)
     tests/test_agent.cpp
     tests/test_context.cpp
     tests/test_rate_limit.cpp
-    tests/test_logger_header_only.cpp)
+    tests/test_logger_header_only.cpp
+    tests/test_field_values.cpp
+    tests/test_include_order_etch_first.cpp
+    tests/test_include_order_windows_first.cpp
+    tests/test_delivery.cpp)
 
   add_executable(etch_tests ${ETCH_TEST_SOURCES})
   set_property(TARGET etch_tests PROPERTY ETCH_OWN_MIN_LEVEL ON)  # the suite assumes floor 0

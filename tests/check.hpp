@@ -34,6 +34,7 @@ inline int& current_failures() {
 inline void fail(std::string_view what, const char* file, int line) {
   ++current_failures();
   std::println("    FAILED {}:{}: {}", file, line, what);
+  std::fflush(stdout);  // reaches a pipe even if a later test hangs the binary
 }
 
 inline void require(bool ok, const char* expr, const char* file, int line) {
@@ -71,6 +72,7 @@ inline int run(int argc, char** argv) {
     }
     const bool ok = current_failures() == before;
     std::println("{} {}", ok ? "  ok  " : "  FAIL", test.name);
+    std::fflush(stdout);  // the mutation script reads this through a pipe, hang or not
     (ok ? passed : failed)++;
   }
   const auto elapsed = std::chrono::steady_clock::now() - start;

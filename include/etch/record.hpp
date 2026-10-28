@@ -13,6 +13,7 @@
 #include <format>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <source_location>
 #include <string>
@@ -47,11 +48,21 @@ struct IsDuration : std::false_type {};
 template <class Rep, class Period>
 struct IsDuration<std::chrono::duration<Rep, Period>> : std::true_type {};
 
+// A type std::format can print. std::formattable is the standard test, but it checks the
+// formatter against a context type of its own, and a formatter written the common way,
+// "format(const T&, std::format_context&)", fails it while std::format("{}", v) compiles.
+// The second clause accepts that form.
+template <class T>
+concept HasFormatter =
+    std::formattable<const T&, char> ||
+    requires(const T& v, std::format_context& ctx) { std::formatter<T, char>{}.format(v, ctx); };
+
 // Converts any sensible value to a FieldValue. Integers become int64 (an unsigned value past
 // int64's range becomes its decimal string, never a wrong number); floating point becomes
 // double; bool stays bool; a char becomes a one-character string; an enum becomes its
-// underlying integer; a chrono duration becomes whole nanoseconds; a path becomes UTF-8 text;
-// anything std::format can print becomes that text.
+// underlying integer unless it has a std::formatter, which then names it the way "{}" would; a
+// chrono duration becomes whole nanoseconds; a path becomes UTF-8 text; anything else
+// std::format can print becomes that text.
 template <class T>
 FieldValue to_field_value(const T& v) {
   using U = std::remove_cvref_t<T>;
@@ -61,6 +72,8 @@ FieldValue to_field_value(const T& v) {
     return v;
   } else if constexpr (std::is_same_v<U, char>) {
     return std::string(1, v);
+  } else if constexpr (std::is_enum_v<U> && HasFormatter<U>) {
+    return std::format("{}", v);
   } else if constexpr (std::is_enum_v<U>) {
     // Always a number: a char-backed enum goes through int; wider ones keep the unsigned rule
     // (a value past int64 becomes its decimal string, never a wrong number).
@@ -74,7 +87,8 @@ FieldValue to_field_value(const T& v) {
     if constexpr (std::is_signed_v<U>) {
       return static_cast<std::int64_t>(v);
     } else {
-      if (v <= static_cast<U>(std::numeric_limits<std::int64_t>::max())) {
+      // Parenthesised: <windows.h> defines max() as a macro, and etch may be included after it.
+      if (v <= static_cast<U>((std::numeric_limits<std::int64_t>::max)())) {
         return static_cast<std::int64_t>(v);
       }
       return std::format("{}", v);
@@ -87,8 +101,8 @@ FieldValue to_field_value(const T& v) {
     // range it clamps, and a non-finite floating duration stays non-finite (JSON writes null).
     const long double estimate = std::chrono::duration<long double, std::nano>(v).count();
     if (!std::isfinite(estimate)) return static_cast<double>(estimate);
-    constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
-    constexpr auto kMin = std::numeric_limits<std::int64_t>::min();
+    constexpr auto kMax = (std::numeric_limits<std::int64_t>::max)();
+    constexpr auto kMin = (std::numeric_limits<std::int64_t>::min)();
     constexpr long double kSafe = 9.0e18L;  // below int64's range, far above any real duration
     if (estimate >= kSafe) return kMax;
     if (estimate <= -kSafe) return kMin;
@@ -102,10 +116,10 @@ FieldValue to_field_value(const T& v) {
     return utf8(v);
   } else if constexpr (StringLike<U>) {
     return std::string(std::string_view(v));
-  } else if constexpr (std::formattable<const U&, char>) {
+  } else if constexpr (HasFormatter<U>) {
     return std::format("{}", v);
   } else {
-    static_assert(std::formattable<const U&, char>,
+    static_assert(HasFormatter<U>,
                   "etch: a field value must be a number, bool, string, char, enum, chrono "
                   "duration, filesystem path, or a type with a std::formatter");
   }
@@ -131,6 +145,8 @@ struct Frame {
   std::uint32_t line = 0;
 };
 
+class Sink;
+
 // Everything a sink needs to know about one log call. Owns its strings, so it can outlive the
 // call (the async sink queues records across threads). The message is what a person reads; the
 // members after it carry the same information as data, for the JSON output.
@@ -150,6 +166,13 @@ struct Record {
   std::vector<std::byte> bytes;  // the data behind a hexdump, up to its limit
   std::vector<Frame> stack;      // the stacktrace behind a fatal, one entry per frame
   std::optional<std::chrono::nanoseconds> duration;  // a scope timer's elapsed time
+  // Internal: the sinks this record must never reach, because it was logged from inside their
+  // writes (see delivery.hpp); null for an ordinary record. It travels with the record through
+  // an async queue, so two sinks behind two queues cannot feed each other forever either.
+  std::shared_ptr<const std::vector<const Sink*>> lineage;
+  // Internal: what anything logged in response to this record must not reach, when that is
+  // more than the lineage. Set on an async sink's gap marker, which itself may go anywhere.
+  std::shared_ptr<const std::vector<const Sink*>> ancestry;
 
   std::string_view user_message() const noexcept {
     return std::string_view(message).substr(0, message_user_length);
@@ -243,11 +266,12 @@ struct Palette {
   std::string_view name_colour(std::string_view name) const noexcept {
     return names[detail::fnv1a(name) % names.size()];
   }
+  // (std::min) rather than std::min: <windows.h> defines min as a macro, and etch may follow it.
   std::string_view level_colour(Level l) const noexcept {
-    return level[std::min(static_cast<std::size_t>(l), kLevelCount - 1)];
+    return level[(std::min)(static_cast<std::size_t>(l), kLevelCount - 1)];
   }
   std::string_view message_colour(Level l) const noexcept {
-    return message[std::min(static_cast<std::size_t>(l), kLevelCount - 1)];
+    return message[(std::min)(static_cast<std::size_t>(l), kLevelCount - 1)];
   }
 };
 
@@ -294,12 +318,6 @@ inline const std::chrono::time_zone* cached_local_zone() {
   return zone;
 }
 #endif
-
-inline void warm_up_time_zone() noexcept {
-#if ETCH_HAS_TIME_ZONES
-  (void)cached_local_zone();
-#endif
-}
 
 }  // namespace detail
 
@@ -366,6 +384,20 @@ inline void format_time(std::string& out, std::chrono::system_clock::time_point 
 
 namespace detail {
 
+// The sinks call this from their constructors so the cost lands at setup, not on the first
+// line. Loading the tz database is the known part; on MSVC the first formatting of a
+// zoned_time costs about 5 ms more, so one timestamp is formatted here too and thrown away.
+inline void warm_up_time_zone() noexcept {
+#if ETCH_HAS_TIME_ZONES
+  try {
+    std::string scratch;
+    format_time(scratch, std::chrono::system_clock::now(), /*utc=*/false);
+  } catch (...) {
+    // No tz database, or no memory: the first line pays instead, as before.
+  }
+#endif
+}
+
 constexpr std::string_view kHexDigits = "0123456789abcdef";
 
 // Writes one C0 control character or ESC in a form that cannot act on a terminal or pose as
@@ -391,25 +423,148 @@ inline void append_escaped_control(unsigned char c, std::string& out) {
   }
 }
 
+// Three groups of characters beyond the C0 controls can still command a terminal or rearrange
+// a line: the C1 controls U+0080..U+009F (U+009B introduces an escape sequence in some
+// terminals), the bidirectional overrides U+202A..U+202E and U+2066..U+2069 (U+202E reverses
+// how the rest of the line is displayed), and the line and paragraph separators U+2028 and
+// U+2029 (a Unicode-aware reader breaks the line there, with no continuation indent). If
+// `text` starts with one, well formed (a lead byte followed by continuation bytes), writes it
+// as \uXXXX and returns how many bytes it took; otherwise returns 0 and writes nothing. Bytes
+// that are not well-formed UTF-8 are not decoded, so nothing is invented from them.
+// Length of the UTF-8 sequence starting at text[i] if it is well formed, else 0. Checks the
+// lead byte, the continuation bytes, overlong forms, surrogates and the U+10FFFF ceiling.
+inline std::size_t utf8_sequence_length(std::string_view text, std::size_t i) noexcept {
+  const auto byte = [&](std::size_t k) { return static_cast<unsigned char>(text[k]); };
+  const unsigned char lead = byte(i);
+  std::size_t length = 0;
+  unsigned char second_min = 0x80;
+  unsigned char second_max = 0xbf;
+  if (lead < 0x80) return 1;
+  if (lead >= 0xc2 && lead <= 0xdf) {
+    length = 2;
+  } else if (lead >= 0xe0 && lead <= 0xef) {
+    length = 3;
+    if (lead == 0xe0) second_min = 0xa0;  // no overlong three-byte forms
+    if (lead == 0xed) second_max = 0x9f;  // no UTF-16 surrogates
+  } else if (lead >= 0xf0 && lead <= 0xf4) {
+    length = 4;
+    if (lead == 0xf0) second_min = 0x90;  // no overlong four-byte forms
+    if (lead == 0xf4) second_max = 0x8f;  // nothing past U+10FFFF
+  } else {
+    return 0;
+  }
+  if (i + length > text.size()) return 0;
+  const unsigned char second = byte(i + 1);
+  if (second < second_min || second > second_max) return 0;
+  for (std::size_t k = 2; k < length; ++k) {
+    if ((byte(i + k) & 0xc0) != 0x80) return 0;
+  }
+  return length;
+}
+
+inline std::size_t append_escaped_unicode_control(std::string_view text, std::string& out) {
+  constexpr unsigned kC1Lead = 0xc2;    // U+0080..U+00BF start with this byte
+  constexpr unsigned kBidiLead = 0xe2;  // U+2000..U+2FFF start with this byte
+  constexpr unsigned kFirstC1 = 0x80;
+  constexpr unsigned kLastC1 = 0x9f;
+  const auto byte = [&](std::size_t i) { return static_cast<unsigned>(text[i]) & 0xffu; };
+  const auto continuation = [&](std::size_t i) { return (byte(i) & 0xc0u) == 0x80u; };
+  unsigned code = 0;
+  std::size_t length = 0;
+  if (text.size() >= 2 && byte(0) == kC1Lead && byte(1) >= kFirstC1 && byte(1) <= kLastC1) {
+    code = byte(1);
+    length = 2;
+  } else if (text.size() >= 3 && byte(0) == kBidiLead && continuation(1) && continuation(2)) {
+    const unsigned candidate =
+        ((byte(0) & 0x0fu) << 12) | ((byte(1) & 0x3fu) << 6) | (byte(2) & 0x3fu);
+    const bool unsafe = (candidate >= 0x202a && candidate <= 0x202e) ||
+                        (candidate >= 0x2066 && candidate <= 0x2069) || candidate == 0x2028 ||
+                        candidate == 0x2029;
+    if (unsafe) {
+      code = candidate;
+      length = 3;
+    }
+  }
+  if (length == 0) return 0;
+  out += "\\u";
+  out += kHexDigits[(code >> 12) & 0xf];
+  out += kHexDigits[(code >> 8) & 0xf];
+  out += kHexDigits[(code >> 4) & 0xf];
+  out += kHexDigits[code & 0xf];
+  return length;
+}
+
+// How a piece of text sits in a line. kMessage: a newline becomes a newline plus two spaces,
+// so a multi-line message continues on indented lines, and tabs stay. kQuoted (a field
+// value): the quote and the backslash are escaped too, and a newline is \n. kName (a logger
+// name, between brackets): every control is escaped, a newline as \n, and so are the
+// backslash and the closing bracket, which ends the column; quotes are left alone.
+enum class TextForm { kMessage, kQuoted, kName };
+
+// Copies text into a line with every byte that could pose as structure or drive the terminal
+// escaped: the C0 controls, DEL and the Unicode controls above, in the given form.
+inline void append_escaped_text(std::string_view text, std::string& out, TextForm form) {
+  constexpr unsigned char kLastControl = 0x1f;
+  constexpr unsigned char kDelete = 0x7f;
+  const bool quoted = form == TextForm::kQuoted;
+  const bool message = form == TextForm::kMessage;
+  for (std::size_t i = 0; i < text.size();) {
+    const auto c = static_cast<unsigned char>(text[i]);
+    if (quoted && c == '"') {
+      out += "\\\"";
+    } else if (!message && c == '\\') {
+      out += "\\\\";  // so an escape written here cannot be mistaken for text that was there
+    } else if (form == TextForm::kName && c == ']') {
+      out += "\\]";  // the name's closing bracket is the column boundary
+    } else if (message && c == '\n') {
+      out += "\n  ";
+    } else if (message && c == '\t') {
+      out += '\t';
+    } else if (c <= kLastControl || c == kDelete) {
+      append_escaped_control(c, out);
+    } else if (const std::size_t took = append_escaped_unicode_control(text.substr(i), out)) {
+      i += took;
+      continue;
+    } else if (c >= 0x80) {
+      // A byte that is not part of a well-formed UTF-8 sequence is escaped on its own: a raw
+      // 0x9b, say, is the eight-bit escape-sequence introducer to some terminals.
+      const std::size_t length = utf8_sequence_length(text, i);
+      if (length == 0) {
+        append_escaped_control(c, out);
+      } else {
+        out.append(text.data() + i, length);
+        i += length;
+        continue;
+      }
+    } else {
+      out += static_cast<char>(c);
+    }
+    ++i;
+  }
+}
+
+// A key is written bare when it is made of letters, digits, '_', '.' and '-'. Any other key
+// (one that came from data: a query parameter, a header name) is quoted and escaped like a
+// value, so it cannot carry the space, '=' or newline that would make it pose as another
+// field or another record.
+inline bool is_bare_key(std::string_view key) noexcept {
+  if (key.empty()) return false;
+  for (const unsigned char c : key) {
+    const bool bare = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                      c == '_' || c == '.' || c == '-';
+    if (!bare) return false;
+  }
+  return true;
+}
+
 }  // namespace detail
 
 // A string inside a text line, quoted, with the quote, the backslash and every control
 // character escaped so a value cannot pose as another field, another record, or a terminal
 // command.
 inline void append_quoted_text(std::string_view text, std::string& out) {
-  constexpr unsigned char kLastControl = 0x1f;
   out += '"';
-  for (const unsigned char c : text) {
-    if (c == '"') {
-      out += "\\\"";
-    } else if (c == '\\') {
-      out += "\\\\";
-    } else if (c <= kLastControl || c == 0x7f) {
-      detail::append_escaped_control(c, out);
-    } else {
-      out += static_cast<char>(c);
-    }
-  }
+  detail::append_escaped_text(text, out, detail::TextForm::kQuoted);
   out += '"';
 }
 
@@ -418,24 +573,18 @@ inline void append_quoted_text(std::string_view text, std::string& out) {
 // never produce a line that looks like a new record; other control characters and ESC are
 // escaped so a message cannot drive the terminal.
 inline void append_message_text(std::string_view text, std::string& out) {
-  constexpr unsigned char kLastControl = 0x1f;
-  for (const unsigned char c : text) {
-    if (c == '\n') {
-      out += "\n  ";
-    } else if (c == '\t') {
-      out += '\t';
-    } else if (c <= kLastControl || c == 0x7f) {
-      detail::append_escaped_control(c, out);
-    } else {
-      out += static_cast<char>(c);
-    }
-  }
+  detail::append_escaped_text(text, out, detail::TextForm::kMessage);
 }
 
-// key=value as a person reads it: strings quoted and escaped, numbers and booleans bare. Keys
-// are written as given; keep them to letters, digits and underscores.
+// key=value as a person reads it: strings quoted and escaped, numbers and booleans bare. A key
+// of letters, digits, '_', '.' and '-' is written as given; any other key is quoted and
+// escaped too (see is_bare_key).
 inline void append_field_text(const Field& field, std::string& out) {
-  out += field.key;
+  if (detail::is_bare_key(field.key)) {
+    out += field.key;
+  } else {
+    append_quoted_text(field.key, out);
+  }
   out += '=';
   std::visit(
       [&](const auto& v) {
@@ -454,7 +603,9 @@ inline void append_field_text(const Field& field, std::string& out) {
 // Appends one record as a single line (no trailing newline):
 //   2026-10-20 18:19:58.582 INFO  [main] [1] demo.cpp:42: message key=value
 // A line that starts with a digit is a record; a line that starts with whitespace continues the
-// previous one. Sinks pass the same string every time, so a steady stream allocates nothing.
+// previous one. The fields follow the caller's message on the record line, before any text etch
+// appended (dump rows, stack frames), so a reader finds them on the line that starts the
+// record. Sinks pass the same string every time, so a steady stream allocates nothing.
 inline void format_line(const Record& r, const LineStyle& s, std::string& out) {
   auto app = std::back_inserter(out);
   const Palette& p = s.palette;
@@ -477,7 +628,13 @@ inline void format_line(const Record& r, const LineStyle& s, std::string& out) {
   out += ' ';
   if (s.name) {
     wrap([&] { return p.name_colour(r.logger_name); },
-         [&] { std::format_to(app, "[{}]", r.logger_name); });
+         [&] {
+           // Escaped like everything else: a name is usually a literal, but nothing stops a
+           // program from naming a logger after data.
+           out += '[';
+           detail::append_escaped_text(r.logger_name, out, detail::TextForm::kName);
+           out += ']';
+         });
     out += ' ';
   }
   if (s.thread) {
@@ -492,14 +649,12 @@ inline void format_line(const Record& r, const LineStyle& s, std::string& out) {
     out += ' ';
   }
   wrap([&] { return p.message_colour(r.level); },
-       [&] {
-         append_message_text(r.user_message(), out);
-         out += r.appended_text();  // etch's own lines, already indented and safe
-       });
+       [&] { append_message_text(r.user_message(), out); });
   for (const auto& field : r.fields) {
     out += ' ';
     append_field_text(field, out);
   }
+  out += r.appended_text();  // etch's own lines, already indented and safe
 }
 
 inline std::string format_line(const Record& r, const LineStyle& s) {

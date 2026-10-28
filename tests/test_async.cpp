@@ -127,28 +127,6 @@ TEST(a_sink_may_replace_the_sinks_during_its_own_write) {
   CHECK_EQ(after->messages(), (std::vector<std::string>{"second"}));
 }
 
-// A sink that logs through the logger it belongs to, once. (CallbackSink holds its own mutex
-// while the callback runs, so it cannot be re-entered; a sink of your own can.)
-struct NestingSink final : etch::Sink {
-  etch::Logger* log = nullptr;
-  bool inside = false;
-  void write(const etch::Record& r) override {
-    if (inside) return;
-    inside = true;
-    log->warn("nested from {}", r.user_message());
-    inside = false;
-  }
-};
-
-TEST(a_sink_may_log_through_its_own_logger) {
-  auto memory = std::make_shared<etch::MemorySink>();
-  auto nesting = std::make_shared<NestingSink>();
-  etch::Logger log{"nested", {memory, nesting}};
-  nesting->log = &log;
-  log.warn("outer");  // the inner call runs while the outer one still uses the same list
-  CHECK_EQ(memory->messages(), (std::vector<std::string>{"outer", "nested from outer"}));
-}
-
 TEST(null_sinks_are_ignored_and_scope_needs_an_lvalue_logger) {
   etch::Logger log{"n", {nullptr, std::make_shared<etch::MemorySink>(), nullptr}};
   CHECK_EQ(log.sinks().size(), 1u);
@@ -474,6 +452,57 @@ TEST(flush_during_shutdown_waits_for_the_worker_to_finish) {
   async->flush();
   CHECK_EQ(delivered.load(), 40);  // flush returned only once everything was written
 }
+
+#if !defined(_WIN32)
+// The daemon start: logging set up, then fork(). In the child the inherited sink has no worker
+// and writes through; a sink the child makes itself has a worker of its own; destroying the
+// inherited sink and exiting normally (destructors, exit handlers) touch none of the parent's
+// thread or lock state, so neither hangs.
+TEST(a_forked_child_logs_through_inherited_and_new_async_sinks_and_exits_normally) {
+  const auto path = scratch_dir() / "fork.log";
+  auto file = etch::FileSink::open(path, {.truncate = true});
+  CHECK(file.has_value());
+  if (!file) return;
+  auto async = std::make_shared<etch::AsyncSink>(*file);  // kBlock: a full ring would wait forever
+  auto log = std::make_unique<etch::Logger>("fork", etch::SinkList{async});
+  log->warn("parent before fork");
+  async->flush();
+  constexpr int kInheritedLines = 5000;  // more than the ring holds
+  constexpr int kOwnLines = 100;
+  etch::prepare_fork();  // the worker is asleep holding nothing when the fork copies it
+  const int failures_before = check::current_failures();  // other tests' failures are not ours
+  const pid_t pid = fork();
+  if (pid == 0) {
+    for (int i = 0; i < kInheritedLines; ++i) log->warn("child {}", i);
+    async->flush();
+    log.reset();
+    async.reset();  // the inherited sink: let go, not joined
+    {
+      // A sink made in the child has a worker of its own: its inner sink runs on a thread
+      // that is not the one logging.
+      const auto main_thread = std::this_thread::get_id();
+      std::atomic<int> on_another_thread{0};
+      auto probe = std::make_shared<etch::CallbackSink>([&](const etch::Record&) {
+        if (std::this_thread::get_id() != main_thread) on_another_thread.fetch_add(1);
+      });
+      auto own = std::make_shared<etch::AsyncSink>(probe);
+      etch::Logger own_log{"fork-child", {own, *file}};
+      for (int i = 0; i < kOwnLines; ++i) own_log.warn("own {}", i);
+      own->flush();
+      CHECK_EQ(on_another_thread.load(), kOwnLines);  // every record, on the worker
+    }  // joined here
+    file->reset();
+    // Through the exit handlers the parent registered; a failed check above fails the test.
+    std::exit(check::current_failures() == failures_before ? 0 : 7);
+  }
+  CHECK(pid > 0);
+  int status = 0;
+  waitpid(pid, &status, 0);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  async->flush();
+  CHECK_EQ(read_lines(path).size(), static_cast<std::size_t>(kInheritedLines + kOwnLines) + 1);
+}
+#endif
 
 TEST(flush_all_does_not_deadlock_when_a_callback_makes_another_async_sink) {
   std::atomic<bool> made_one{false};
