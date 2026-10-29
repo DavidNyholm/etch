@@ -131,6 +131,9 @@ class AsyncSink final : public Sink {
         sync_(std::make_unique<Sync>()),
         generation_(detail::fork_generation().load(std::memory_order_relaxed)) {
     try {
+      // The worker's sweep storage is made here, where a failure is the constructor's to
+      // throw, not on the worker, where it would end the process.
+      batch_storage_.reserve((std::min)(ring_.capacity(), kMaxBatch));  // not the parameter
       register_self();  // also starts the worker, or decides there will be none
     } catch (...) {
       shutdown();
@@ -639,8 +642,7 @@ class AsyncSink final : public Sink {
     }
     detail::on_async_worker() = true;
     const std::size_t batch_limit = (std::min)(capacity(), kMaxBatch);
-    std::vector<Record> batch;
-    batch.reserve(batch_limit);
+    std::vector<Record> batch = std::move(batch_storage_);  // reserved by the constructor
     std::size_t batch_end = 0;  // dequeue position after the batch most recently written
     bool flushed_since_write = true;
     for (;;) {
@@ -754,6 +756,7 @@ class AsyncSink final : public Sink {
                                                      // everything queued before this position
   std::atomic<std::size_t> flush_served_pos_{0};     // the worker had written this much when
                                                      // it last flushed for such a request
+  std::vector<Record> batch_storage_;     // reserved before the worker starts; the worker takes it
   std::unique_ptr<std::jthread> worker_;  // started in the constructor body, once the rest exists
 };
 

@@ -49,16 +49,20 @@ inline std::atomic<AsyncRegistry*>& async_registry_slot() noexcept {
   static std::atomic<AsyncRegistry*> slot{nullptr};
   return slot;
 }
+// Sequentially consistent on both sides, with the exiting flag (see shutdown_all): the first
+// sink publishes the registry and then reads the flag, the exit drain writes the flag and
+// then reads the registry, so one of them sees the other and no sink starts a worker that
+// nothing will drain.
 inline AsyncRegistry& async_registry() {
   static AsyncRegistry* const registry = [] {
     auto* made = new AsyncRegistry;
-    async_registry_slot().store(made, std::memory_order_release);
+    async_registry_slot().store(made, std::memory_order_seq_cst);
     return made;
   }();
   return *registry;
 }
 inline AsyncRegistry* async_registry_if_made() noexcept {
-  return async_registry_slot().load(std::memory_order_acquire);
+  return async_registry_slot().load(std::memory_order_seq_cst);
 }
 
 // Counts the forks this process has been through, so a sink can tell whether it was made in

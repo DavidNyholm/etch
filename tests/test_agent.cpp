@@ -210,6 +210,40 @@ TEST(the_exit_summary_counts_what_the_drain_held_back) {
   CHECK(lines[0].find("\"warn\":2") != std::string::npos);
 }
 
+// Child probe: the summary installed first, so its handler runs last; a handler registered
+// after it logs through once() twice; an async sink made last, so its handler runs first and
+// drains before either. The final object must still carry the held-back report of that
+// later handler's second call: the summary's handler reports whatever the order.
+TEST(zz_child_probe_the_exit_summary_reports_what_later_handlers_held_back) {
+  if (!in_child()) return;
+  const std::filesystem::path path = etch::detail::env("ETCH_TEST_SUMMARY_PATH");
+  CHECK(!path.empty());
+  if (path.empty()) return;
+  (void)etch::SummarySink::install(path);
+  std::atexit([] {
+    for (int i = 0; i < 2; ++i) etch::once().warn("from a later exit handler {}", i);
+  });
+  static auto async = std::make_shared<etch::AsyncSink>(std::make_shared<etch::MemorySink>());
+  static etch::Logger log{"order", {async}};
+  log.warn("queued before exit");
+  std::exit(check::current_failures() == 0 ? 0 : 7);
+}
+
+TEST(the_exit_summary_reports_what_later_handlers_held_back) {
+  const auto path = scratch_dir() / "order-summary.json";
+  const std::string path_utf8 = etch::utf8(path);
+  CHECK_EQ(
+      run_test_in_child("zz_child_probe_the_exit_summary_reports_what_later_handlers_held_back",
+                        {{"ETCH_TEST_SUMMARY_PATH", path_utf8.c_str()}}),
+      0);
+  const auto lines = read_lines(path);
+  CHECK_EQ(lines.size(), 1u);
+  if (lines.empty()) return;
+  // Through the default logger: the admitted call, and the report for the held one.
+  CHECK(lines[0].find("\"records\":2") != std::string::npos);
+  CHECK(lines[0].find("\"warn\":2") != std::string::npos);
+}
+
 // The run id in a summary object, or an empty string.
 std::string run_id_in(const std::string& json) {
   const auto key = json.find("\"run_id\":\"");

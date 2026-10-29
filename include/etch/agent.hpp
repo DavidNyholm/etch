@@ -356,9 +356,9 @@ class SummarySink final : public Sink {
   // held-back counts are reported, every async worker is closed and drained in turn (so work
   // queued behind another async sink is drained too, not merely flushed once), the counts
   // made by that drain are reported through the then-synchronous sinks, and only then are
-  // the watched files flushed and the final object written. Those exit-time reports are made
-  // once in the process, so the async exit handler that follows reports nothing the file
-  // could miss. While this
+  // the watched files flushed and the final object written; after that the async sinks' own
+  // exit handler, whichever order the two run in, reports nothing the file could miss. While
+  // this
   // runs, write_now() stands aside (it may be called on this very thread, by a held fatal the
   // report delivers); once it is done a later fatal (another exit handler's) updates the file
   // again. Nothing may throw out of an exit handler, so the whole of it is guarded.
@@ -374,6 +374,9 @@ class SummarySink final : public Sink {
         detail::shutdown_all(/*at_exit=*/true);
         s.sink->flush_watched();
         if (const auto ec = s.sink->write_to(s.path, "exit")) report_failure(s.path, ec);
+        // From here the async sinks' own exit handler reports nothing: a report now would be
+        // a line this file cannot show.
+        detail::summary_finalized().store(true, std::memory_order_release);
       }
     } catch (...) {
       report_failure(s.path, std::make_error_code(std::errc::not_enough_memory));

@@ -25,9 +25,10 @@ inline void flush_all() {
 
 namespace detail {
 
-inline std::atomic<bool>& exit_reports_made() noexcept {
-  static std::atomic<bool> made{false};
-  return made;
+// Set by the run summary's exit handler once its final object is written (agent.hpp).
+inline std::atomic<bool>& summary_finalized() noexcept {
+  static std::atomic<bool> finalized{false};
+  return finalized;
 }
 inline void report_pending_rates_at_shutdown() noexcept {
   try {
@@ -45,9 +46,12 @@ inline void report_pending_rates_at_shutdown() noexcept {
 // written. etch::shutdown() called by the program reports every time and leaves the
 // exit-time reports to the handlers.
 inline void shutdown_all(bool at_exit) noexcept {
-  const bool report = !at_exit || !exit_reports_made().exchange(true, std::memory_order_acq_rel);
+  // Exit handlers report unless the run summary has already written its final object (then
+  // a report would be one the file cannot show); the summary's own handler sets that flag
+  // after its write, so it always reports first, whatever order the handlers run in.
+  const bool report = !at_exit || !summary_finalized().load(std::memory_order_acquire);
   if (report) report_pending_rates_at_shutdown();
-  process_exiting().store(true, std::memory_order_relaxed);
+  process_exiting().store(true, std::memory_order_seq_cst);  // pairs with the first sink's look
   // One entry at a time, claimed under the registry lock and shut down outside it, so no
   // allocation is needed (nothing may throw here) and no sink is joined while the lock is
   // held (a callback of the sink being drained may destroy another sink, whose destructor
