@@ -616,8 +616,7 @@ struct GatedRecorder final : etch::Sink {
 // while the kept producer is still waking, the kept producer keeps waiting, and the flood
 // runs to its cap.
 TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
-  constexpr int kFlood = 2000;        // at least this many, and until the kept record is in
-  constexpr int kFloodCap = 1 << 20;  // bounded, so a broken reservation fails, not hangs
+  constexpr int kFloodCap = 1 << 20;  // the kept record must get in within this many floods
   constexpr int kFlooders = 4;
   auto held = std::make_shared<GatedRecorder>();
   auto async = std::make_shared<etch::AsyncSink>(held, 2, etch::AsyncSink::Overflow::kDrop,
@@ -641,17 +640,16 @@ TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
   std::atomic<bool> stop{false};
   std::atomic<int> next{0};
   std::atomic<int> issued{0};
+  int budget_start = 0;
+  int budget_used = 0;
   {
     std::vector<std::jthread> flooders;
     for (int t = 0; t < kFlooders; ++t) {
       flooders.emplace_back([&] {
         int mine = 0;
         while (!stop.load()) {
-          const int n = next.fetch_add(1);
-          if (n >= kFloodCap) break;
-          log.warn("flood {}", n);
+          log.warn("flood {}", next.fetch_add(1));
           ++mine;
-          if (n >= kFlood && async->waiting() == 0) stop = true;
         }
         issued.fetch_add(mine);
       });
@@ -662,13 +660,23 @@ TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
     // marker (a write of its own), sweeps both slots (freeing them, and waking the kept
     // producer) and parks again at its third write, the next marker.
     held->allowed = 2;
+    for (int i = 0; i < 5000 && held->entered.load() < 3; ++i) std::this_thread::sleep_for(1ms);
+    CHECK_EQ(held->entered.load(), 3);  // the sweep has happened: the slots were freed
+    // The budget starts only now, so a slow start of this thread cannot spend it: from here
+    // the kept record must get in within kFloodCap flood records.
+    budget_start = next.load();
+    while (async->waiting() > 0 && next.load() - budget_start < kFloodCap) {
+      std::this_thread::yield();
+    }
+    budget_used = next.load() - budget_start;
+    stop = true;
   }  // the flooders are joined here
   const int sent = issued.load();
   // The kept record got in while the flood was still running, not after it gave up: with
-  // the reservation removed, the flood takes the freed slots and runs to the cap. Stress
+  // the reservation removed, the flood takes the freed slots and the budget runs out. Stress
   // coverage, not a proof: a schedule that deschedules every flooder at the moment the slots
   // free passes either way, and the retry window itself has no hook to pin it.
-  CHECK(sent < kFloodCap);
+  CHECK(budget_used < kFloodCap);
   CHECK_EQ(async->waiting(), 0u);
   held->allowed = 1 << 20;  // let everything through
   kept.join();

@@ -284,19 +284,25 @@ class SummarySink final : public Sink {
     }
     const std::string object = json(written_at);
     std::error_code ec;
-    if (std::filesystem::exists(path, ec)) return write_file(path, object, /*exclusive=*/false);
+    // The entry itself, not what it points to: a symlink (dangling or not) is written through,
+    // never replaced by a plain file, so a summary linked into a private directory stays
+    // there. Only a name with nothing behind it gets the staged first write.
+    if (std::filesystem::symlink_status(path, ec).type() != std::filesystem::file_type::not_found) {
+      return write_file(path, object, /*exclusive=*/false, nullptr);
+    }
     static std::atomic<unsigned> temporaries{0};
     std::filesystem::path temporary = path;
     temporary += std::format(".{}.{}.tmp", detail::process_id(),
                              temporaries.fetch_add(1, std::memory_order_relaxed));
-    if (const auto write_ec = write_file(temporary, object, /*exclusive=*/true)) {
-      std::filesystem::remove(temporary, ec);
+    bool created = false;
+    if (const auto write_ec = write_file(temporary, object, /*exclusive=*/true, &created)) {
+      if (created) std::filesystem::remove(temporary, ec);  // ours; a name that was taken is not
       return write_ec;
     }
     std::filesystem::rename(temporary, path, ec);
     if (!ec) return {};
     std::filesystem::remove(temporary, ec);
-    return write_file(path, object, /*exclusive=*/false);  // refused rename: in place after all
+    return write_file(path, object, /*exclusive=*/false, nullptr);  // refused rename: in place
   }
 
   // Attaches a summary sink to the default logger (and so to every etch::get() logger),
@@ -385,8 +391,11 @@ class SummarySink final : public Sink {
     // the final object, and may be this very thread), install() for an instant, or another
     // fatal's writer in its file I/O; waiting for the last two is bounded and never waits for
     // a worker, and it is what keeps a second fatal's counts out of an older object.
-    while (!slot.mutex.try_lock()) {
+    for (;;) {
+      // The flag first, every time: the handler may be this very thread, and trying a mutex
+      // this thread already holds is not allowed, not even to be told no.
       if (slot.exit_handler_running.load(std::memory_order_seq_cst)) return;
+      if (slot.mutex.try_lock()) break;
       std::this_thread::yield();
     }
     std::lock_guard lock(slot.mutex, std::adopt_lock);
@@ -410,16 +419,20 @@ class SummarySink final : public Sink {
     return *mutex;
   }
 
+  // `created`, when given, says whether the file was opened by this call (so a failed
+  // exclusive open leaves nothing to clean up). The close is checked too: a write that the
+  // filesystem only refuses at close is a failure, not a published summary.
   static std::error_code write_file(const std::filesystem::path& path, const std::string& object,
-                                    bool exclusive) {
+                                    bool exclusive, bool* created) {
     errno = 0;
     auto mode = std::ios::out | std::ios::binary | std::ios::trunc;
     if (exclusive) mode |= std::ios::noreplace;  // a temporary is ours alone, or not opened
     std::ofstream out(path, mode);
+    if (created != nullptr) *created = out.is_open();
     if (!out.is_open()) return std::error_code(errno != 0 ? errno : EIO, std::generic_category());
     out << object << '\n';
-    out.flush();
-    return out ? std::error_code{} : std::make_error_code(std::errc::io_error);
+    out.close();
+    return out.fail() ? std::make_error_code(std::errc::io_error) : std::error_code{};
   }
 
   // No logger to report to (the summary is a sink, and at exit none may be left): stderr is

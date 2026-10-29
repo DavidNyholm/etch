@@ -726,7 +726,19 @@ class AsyncSink final : public Sink {
   static void shutdown_all() noexcept {
     report_pending_rates_at_shutdown();
     detail::process_exiting().store(true, std::memory_order_relaxed);
-    for_each_live([](AsyncSink& sink) { sink.shutdown(); });
+    try {
+      for_each_live([](AsyncSink& sink) { sink.shutdown(); });
+    } catch (...) {
+      // No memory for the snapshot of the live list: the sinks are shut down under the
+      // registry lock instead, which allocates nothing. A sink made by a callback during
+      // that drain would wait for the lock; at exit, with no memory, that is the lesser risk.
+      auto& registry = detail::async_registry();
+      std::lock_guard lock(registry.mutex);
+      for (const auto& entry : registry.live) {
+        std::lock_guard entry_lock(entry->mutex);
+        if (AsyncSink* sink = entry->sink.load(std::memory_order_relaxed)) sink->shutdown();
+      }
+    }
     report_pending_rates_at_shutdown();
   }
   static void report_pending_rates_at_shutdown() noexcept {
