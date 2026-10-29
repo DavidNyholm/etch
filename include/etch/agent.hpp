@@ -26,6 +26,7 @@
 
 #include "async_sink.hpp"
 #include "default_logger.hpp"
+#include "file_sink.hpp"
 #include "json.hpp"
 #include "level.hpp"
 #include "logger.hpp"

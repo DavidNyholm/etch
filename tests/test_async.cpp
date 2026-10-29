@@ -519,4 +519,112 @@ TEST(flush_all_does_not_deadlock_when_a_callback_makes_another_async_sink) {
   CHECK(made_one.load());
 }
 
+// ---- sweeps and reserved slots (0.5.0) ---------------------------------------------------
+
+// Inside a sweep (begin_batch .. end_batch) a line at flush_on is held in the stream buffer
+// and flushed once when the sweep ends; outside a sweep it is flushed at once; a sweep with
+// nothing at flush_on in it flushes nothing.
+TEST(a_file_sink_holds_its_level_flush_until_the_sweep_ends) {
+  const auto path = scratch_dir() / "sweep.log";
+  // error/warn rather than warn/info: the min-level build compiles info out.
+  auto file = etch::FileSink::open(path, {.flush_on = etch::Level::kError, .truncate = true});
+  CHECK(file.has_value());
+  if (!file) return;
+  etch::Logger log{"sweep", {*file}};
+  (*file)->begin_batch();
+  log.error("inside the sweep");
+  CHECK(read_bytes(path).empty());  // still in the stream buffer
+  (*file)->end_batch();
+  CHECK_EQ(read_lines(path).size(), 1u);
+  log.error("outside any sweep");
+  CHECK_EQ(read_lines(path).size(), 2u);
+  (*file)->begin_batch();
+  log.warn("below flush_on");
+  (*file)->end_batch();
+  CHECK_EQ(read_lines(path).size(), 2u);  // nothing asked for a flush
+  (*file)->flush();
+  CHECK_EQ(read_lines(path).size(), 3u);
+  CHECK_EQ((*file)->write_failures(), 0u);
+}
+
+struct SweepCounter final : etch::Sink {
+  std::atomic<int> open{0};
+  std::atomic<int> begins{0};
+  std::atomic<int> ends{0};
+  std::atomic<int> writes{0};
+  std::atomic<int> writes_outside{0};
+  void begin_batch() override {
+    ++begins;
+    ++open;
+  }
+  void end_batch() override {
+    --open;
+    ++ends;
+  }
+  void write(const etch::Record&) override {
+    ++writes;
+    if (open.load() == 0) ++writes_outside;
+  }
+};
+
+TEST(the_worker_writes_every_sweep_inside_a_bracket) {
+  auto counter = std::make_shared<SweepCounter>();
+  {
+    auto async = std::make_shared<etch::AsyncSink>(counter, 8);
+    etch::Logger log{"bracket", {async}};
+    for (int i = 0; i < 100; ++i) log.warn("{}", i);
+    async->flush();
+  }
+  CHECK_EQ(counter->writes.load(), 100);
+  CHECK_EQ(counter->writes_outside.load(), 0);
+  CHECK(counter->begins.load() > 0);
+  CHECK_EQ(counter->begins.load(), counter->ends.load());
+}
+
+// Records what it gets, in order, after a parking phase: the worker sits inside the first
+// write until released, so the ring can be filled and a kept record made to wait.
+struct ParkedRecorder final : etch::Sink {
+  std::atomic<bool> released{false};
+  std::atomic<int> entered{0};
+  std::mutex mutex;
+  std::vector<std::string> messages;
+  void write(const etch::Record& r) override {
+    entered.fetch_add(1);
+    while (!released.load()) std::this_thread::sleep_for(1ms);
+    std::lock_guard lock(mutex);
+    messages.push_back(r.message);
+  }
+};
+
+// Finding 2 of the server testbed: a warning waiting for a slot lost the race to the flood of
+// droppable records that kept taking the freed slots, for up to seconds. Now the flood is
+// dropped while a kept record waits, so the kept record is in the ring before any flood
+// record logged after it began waiting.
+TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
+  auto held = std::make_shared<ParkedRecorder>();
+  auto async = std::make_shared<etch::AsyncSink>(held, 2, etch::AsyncSink::Overflow::kDrop,
+                                                 etch::Level::kError);
+  etch::Logger log{"reserve", {async}};
+  log.warn("parks the worker");
+  for (int i = 0; i < 5000 && held->entered.load() < 1; ++i) std::this_thread::sleep_for(1ms);
+  CHECK_EQ(held->entered.load(), 1);
+  log.warn("slot one");
+  log.warn("slot two");                           // the ring is full and the worker is parked
+  std::jthread kept([&] { log.error("kept"); });  // at keep_from: waits for a slot
+  for (int i = 0; i < 5000 && async->waiting() < 1; ++i) std::this_thread::sleep_for(1ms);
+  CHECK_EQ(async->waiting(), 1u);
+  held->released = true;
+  for (int i = 0; i < 2000; ++i) log.warn("flood {}", i);  // droppable, from now on
+  kept.join();
+  async->flush();
+  std::lock_guard lock(held->mutex);
+  const auto& got = held->messages;
+  const auto kept_at = std::ranges::find(got, "kept");
+  const auto first_flood =
+      std::ranges::find_if(got, [](const std::string& m) { return m.starts_with("flood "); });
+  CHECK(kept_at != got.end());
+  CHECK(kept_at < first_flood);  // also holds when no flood record was delivered at all
+  CHECK_EQ(async->waiting(), 0u);
+}
+
 }  // namespace

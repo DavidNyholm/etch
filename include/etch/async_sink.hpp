@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <bit>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -20,6 +19,7 @@
 
 #include "async_registry.hpp"
 #include "delivery.hpp"
+#include "record_ring.hpp"
 #include "sinks.hpp"
 
 namespace etch {
@@ -34,11 +34,11 @@ namespace etch {
 // Moves the cost of writing (disk, console) off the logging thread. The record is already
 // formatted when it arrives, so the queue only carries finished strings.
 //
-// The queue is a bounded ring of records with a sequence number per slot (Dmitry Vyukov's
-// design). A producer claims a slot with one compare-and-swap and moves its record in; it never
-// takes a lock and never allocates, so the calling thread pays a few atomic operations whether
-// one thread logs or eight do. The worker takes everything that is ready, writes it, and only
-// then looks again.
+// The queue is a bounded ring of records (record_ring.hpp). A producer claims a slot with one
+// compare-and-swap and moves its record in; it never takes a lock and never allocates, so the
+// calling thread pays a few atomic operations whether one thread logs or eight do. The worker
+// takes everything that is ready, writes it as one sweep (the inner sink may hold its flush
+// until the sweep ends), and only then looks again.
 //
 // The mutex exists for the slow paths only: putting the worker to sleep when the queue is empty,
 // blocking a producer when it is full, and waiting in flush(). The sleep handshake is the usual
@@ -49,9 +49,12 @@ namespace etch {
 // When the queue is full the overflow policy decides. kBlock waits for room: nothing is ever
 // lost. kDrop drops the record and counts it, except at or above keep_from (warn by default),
 // where it blocks instead: a game loop is never stalled by trace lines, and an error is never
-// thrown away. Whenever records were dropped, the worker writes one warning from logger "etch"
-// saying how many, before the next real record, when it goes idle, and at shutdown, so the file
-// shows where its gaps are and flush() never returns with a gap unreported.
+// thrown away. While such a record waits for room, droppable records are dropped at once
+// rather than queued, so the slots the worker frees go to the waiting record and not to the
+// flood that filled the ring; the wait is then one sweep of the worker at most, however many
+// threads keep flooding. Whenever records were dropped, the worker writes one warning from logger
+// "etch" saying how many, before the next real record, when it goes idle, and at shutdown, so the
+// file shows where its gaps are and flush() never returns with a gap unreported.
 //
 // flush() returns once every record enqueued before the call is written, however much is logged
 // meanwhile. When the queue goes idle the worker flushes the inner sink, so a crash a little
@@ -87,9 +90,7 @@ class AsyncSink final : public Sink {
   // Slots are allocated up front (a Record plus a sequence number, about 200 bytes on MSVC x64,
   // so the default ring is under a megabyte); hence a modest default.
   static constexpr std::size_t kDefaultCapacity = 4096;
-  // Upper bound for the ring: std::bit_ceil must have a representable result, and 2^30 slots
-  // is already 128 GB of slot storage.
-  static constexpr std::size_t kMaxCapacity = std::size_t{1} << 30;
+  static constexpr std::size_t kMaxCapacity = detail::RecordRing::kMaxCapacity;
   // The worker takes at most this many records per sweep. Producers refill slots as fast as
   // the worker frees them, so an unbounded sweep could collect forever and never write. The
   // bound also sizes the batch storage once, so the worker never allocates while running.
@@ -101,18 +102,13 @@ class AsyncSink final : public Sink {
 
   explicit AsyncSink(std::shared_ptr<Sink> inner, std::size_t capacity = kDefaultCapacity,
                      Overflow policy = Overflow::kBlock, Level keep_from = Level::kWarn)
-      : inner_(std::move(inner)),
-        mask_(std::bit_ceil(std::clamp(capacity, std::size_t{2}, kMaxCapacity)) - 1),
-        slots_(inner_ == nullptr ? nullptr : std::make_unique<Slot[]>(mask_ + 1)),
+      : inner_(require_inner(std::move(inner))),
+        ring_(capacity),
         policy_(policy),
         keep_from_(keep_from),
         counters_(std::make_shared<detail::SinkCounters>()),
         sync_(std::make_unique<Sync>()),
         generation_(detail::fork_generation().load(std::memory_order_relaxed)) {
-    if (inner_ == nullptr) throw std::invalid_argument("etch::AsyncSink: null inner sink");
-    for (std::size_t i = 0; i <= mask_; ++i) {
-      slots_[i].sequence.store(i, std::memory_order_relaxed);
-    }
     try {
       register_self();  // also starts the worker, or decides there will be none
     } catch (...) {
@@ -182,7 +178,7 @@ class AsyncSink final : public Sink {
       // outstanding while the served position is behind it. With nothing queued ahead (the
       // record was written straight through) there is no position to wait for, and the
       // inner sink is flushed here: that waits for a write at most, never for a worker.
-      const std::size_t up_to = enqueue_pos_.load(std::memory_order_seq_cst);
+      const std::size_t up_to = ring_.pushed(std::memory_order_seq_cst);
       if (up_to == written_pos_.load(std::memory_order_seq_cst) && empty()) {
         flush_inner();
         return;
@@ -194,7 +190,7 @@ class AsyncSink final : public Sink {
       wake_worker();
       return;
     }
-    const std::size_t target = enqueue_pos_.load(std::memory_order_seq_cst);
+    const std::size_t target = ring_.pushed(std::memory_order_seq_cst);
     const std::size_t drops = dropped_now();
     {
       std::unique_lock lock(sync_->mutex);
@@ -245,7 +241,7 @@ class AsyncSink final : public Sink {
     }
     {
       std::lock_guard lock(sync_->mutex);
-      written_pos_.store(enqueue_pos_.load(std::memory_order_acquire), std::memory_order_release);
+      written_pos_.store(ring_.pushed(std::memory_order_acquire), std::memory_order_release);
       sync_->drained.notify_all();  // a flush() that was waiting on the worker
     }
     flush_inner();
@@ -276,27 +272,24 @@ class AsyncSink final : public Sink {
   std::shared_ptr<const detail::SinkCounters> counters() const noexcept { return counters_; }
   // Approximate while producers are active; exact once they have stopped.
   std::size_t queued() const noexcept {
-    const std::size_t tail = enqueue_pos_.load(std::memory_order_acquire);
-    const std::size_t head = dequeue_pos_.load(std::memory_order_acquire);
+    const std::size_t tail = ring_.pushed(std::memory_order_acquire);
+    const std::size_t head = ring_.popped(std::memory_order_acquire);
     return tail >= head ? tail - head : 0;  // the two loads are not one snapshot
   }
-  std::size_t capacity() const noexcept { return mask_ + 1; }  // rounded up to a power of two
+  // Producers blocked on a full ring right now (kBlock, or a record at or above keep_from).
+  std::size_t waiting() const noexcept {
+    return producers_waiting_.load(std::memory_order_relaxed);
+  }
+  std::size_t capacity() const noexcept {
+    return ring_.capacity();
+  }  // rounded up to a power of two
   const std::shared_ptr<Sink>& inner() const noexcept { return inner_; }
 
  private:
-  // Cache line size, so the hot counters below do not share a line. A fixed value rather than
-  // std::hardware_destructive_interference_size: GCC warns that the std constant changes with
-  // tuning flags (an ABI hazard for a header), and these are the real sizes anyway.
-#if defined(__aarch64__) || defined(_M_ARM64)
-  static constexpr std::size_t kCacheLine = 128;
-#else
-  static constexpr std::size_t kCacheLine = 64;
-#endif
-
-  struct Slot {
-    std::atomic<std::size_t> sequence;
-    Record record;
-  };
+  static std::shared_ptr<Sink> require_inner(std::shared_ptr<Sink> inner) {
+    if (inner == nullptr) throw std::invalid_argument("etch::AsyncSink: null inner sink");
+    return inner;
+  }
 
   // The locks and condition variables, together so a sink copied by a fork can let them go
   // untouched (see the class comment); the lock-free state stays inline.
@@ -398,45 +391,18 @@ class AsyncSink final : public Sink {
     return counters_->dropped.load(std::memory_order_seq_cst);
   }
 
-  bool try_enqueue(Record& r) noexcept {
-    std::size_t pos = enqueue_pos_.load(std::memory_order_relaxed);
-    for (;;) {
-      Slot& slot = slots_[pos & mask_];
-      const std::size_t seq = slot.sequence.load(std::memory_order_acquire);
-      // Unsigned subtraction, then a (modular, well-defined) conversion: no signed overflow.
-      const auto diff = static_cast<std::intptr_t>(seq - pos);
-      if (diff == 0) {
-        if (enqueue_pos_.compare_exchange_weak(pos, pos + 1, std::memory_order_seq_cst)) {
-          slot.record = std::move(r);
-          slot.sequence.store(pos + 1, std::memory_order_release);
-          return true;
-        }
-      } else if (diff < 0) {
-        return false;  // the slot still holds a record the worker has not taken: full
-      } else {
-        pos = enqueue_pos_.load(std::memory_order_relaxed);  // another producer took it
-      }
-    }
-  }
+  bool try_enqueue(Record& r) noexcept { return ring_.try_push(r); }
+  bool try_dequeue(Record& out) noexcept { return ring_.try_pop(out); }
+  // "Not empty" can mean "claimed but not yet published" (see RecordRing::empty); the worker
+  // handles that by trying again.
+  bool empty() const noexcept { return ring_.empty(); }
 
-  // Single consumer, so no compare-and-swap on the dequeue side.
-  bool try_dequeue(Record& out) noexcept {
-    const std::size_t pos = dequeue_pos_.load(std::memory_order_relaxed);
-    Slot& slot = slots_[pos & mask_];
-    const std::size_t seq = slot.sequence.load(std::memory_order_acquire);
-    if (static_cast<std::intptr_t>(seq - (pos + 1)) < 0) return false;
-    out = std::move(slot.record);
-    slot.sequence.store(pos + mask_ + 1, std::memory_order_release);
-    dequeue_pos_.store(pos + 1, std::memory_order_seq_cst);
-    return true;
-  }
-
-  // Position-based on purpose: the producer's claim (a seq_cst compare-and-swap on
-  // enqueue_pos_) is the write the sleep handshake relies on, so "not empty" can mean "claimed
-  // but not yet published", which the worker handles by trying again.
-  bool empty() const noexcept {
-    return enqueue_pos_.load(std::memory_order_seq_cst) ==
-           dequeue_pos_.load(std::memory_order_seq_cst);
+  // A record the drop policy may lose. While a record it may not lose waits for room, such a
+  // record is dropped at once instead of taking a slot the worker frees (see the class
+  // comment); the one relaxed load is paid only by droppable records.
+  bool drop_now(const Record& r) const noexcept {
+    return policy_ == Overflow::kDrop && r.level < keep_from_ &&
+           producers_waiting_.load(std::memory_order_relaxed) > 0;
   }
   // Sequentially consistent on purpose: a dropping producer increments dropped (seq_cst) and
   // then reads worker_sleeping_; the worker writes worker_sleeping_ and then reads this. That
@@ -463,7 +429,7 @@ class AsyncSink final : public Sink {
       active_producers_.fetch_add(1, std::memory_order_seq_cst);
       bool settled = false;
       if (worker_id_ != std::this_thread::get_id() && !closed_.load(std::memory_order_seq_cst)) {
-        if (try_enqueue(r)) {
+        if (!drop_now(r) && try_enqueue(r)) {
           settled = true;
         } else if (policy_ == Overflow::kDrop && r.level < keep_from_) {
           note_dropped(r);
@@ -490,7 +456,7 @@ class AsyncSink final : public Sink {
       write_inner(std::move(r));
       return;
     }
-    bool queued = try_enqueue(r);
+    bool queued = !drop_now(r) && try_enqueue(r);
     if (!queued) {
       if (policy_ == Overflow::kDrop && r.level < keep_from_) {
         note_dropped(r);
@@ -578,6 +544,20 @@ class AsyncSink final : public Sink {
   void flush_inner() noexcept {
     try {
       inner_->flush();
+    } catch (...) {
+      counters_->write_failures.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  // The sweep brackets (Sink::begin_batch, end_batch), guarded like a write: a sink that logs
+  // from inside them is set aside and kept from this chain the same way.
+  template <class Fn>
+  void bracket_inner(Fn&& fn) noexcept {
+    const detail::DeliveryScope delivery;
+    const detail::WriteScope outer(this);
+    const detail::WriteScope inner(inner_.get());
+    try {
+      fn();
     } catch (...) {
       counters_->write_failures.fetch_add(1, std::memory_order_relaxed);
     }
@@ -676,7 +656,7 @@ class AsyncSink final : public Sink {
       }
       Record r;
       while (batch.size() < batch_limit && try_dequeue(r)) batch.push_back(std::move(r));
-      batch_end = dequeue_pos_.load(std::memory_order_relaxed);
+      batch_end = ring_.popped(std::memory_order_relaxed);
       std::atomic_thread_fence(std::memory_order_seq_cst);  // pairs with the producer's fence
       if (producers_waiting_.load(std::memory_order_relaxed) > 0) {
         std::lock_guard lock(sync_->mutex);
@@ -686,9 +666,12 @@ class AsyncSink final : public Sink {
         std::this_thread::yield();  // a producer claimed a slot but has not published it yet
         continue;
       }
-      if (report_gap()) flushed_since_write = false;
       detail::worker_activity().fetch_add(1, std::memory_order_seq_cst);
+      // One sweep: the gap marker, then the batch; a file sink flushes once at the end of it.
+      bracket_inner([&] { inner_->begin_batch(); });
+      report_gap();
       for (auto& queued : batch) write_inner(std::move(queued));
+      bracket_inner([&] { inner_->end_batch(); });
       batch.clear();
       flushed_since_write = false;
       if (take_flush_request(batch_end)) {
@@ -732,16 +715,13 @@ class AsyncSink final : public Sink {
   friend void prepare_fork();
 
   std::shared_ptr<Sink> inner_;
-  std::size_t mask_;
-  std::unique_ptr<Slot[]> slots_;
+  detail::RecordRing ring_;
   Overflow policy_;
   Level keep_from_;
   std::shared_ptr<detail::SinkCounters> counters_;  // dropped, write failures
   std::unique_ptr<Sync> sync_;
   unsigned generation_;  // the fork generation this sink was made in
-  alignas(kCacheLine) std::atomic<std::size_t> enqueue_pos_{0};
-  alignas(kCacheLine) std::atomic<std::size_t> dequeue_pos_{0};
-  alignas(kCacheLine) std::atomic<bool> worker_sleeping_{false};
+  alignas(detail::kCacheLine) std::atomic<bool> worker_sleeping_{false};
   std::atomic<bool> closed_{false};            // shutdown began: new records wait, then go through
   std::atomic<bool> worker_gone_{false};       // the worker has left its loop
   std::atomic<bool> worker_finished_{false};   // ... and its final drain and flush are done

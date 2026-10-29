@@ -179,12 +179,12 @@ MUTATIONS = [
         ],
     ),
     (
-        "sinks.hpp",
+        "file_sink.hpp",
         "rotation deletes the live file instead of renaming it",
         [("std::filesystem::rename(path_, numbered(1), ec);", "std::filesystem::remove(path_, ec);")],
     ),
     (
-        "sinks.hpp",
+        "file_sink.hpp",
         "file sink never rotates",
         [
             (
@@ -194,7 +194,7 @@ MUTATIONS = [
         ],
     ),
     (
-        "sinks.hpp",
+        "file_sink.hpp",
         "file sink opens in text mode (CRLF on Windows)",
         [("std::ios::out | std::ios::binary |", "std::ios::out |")],
     ),
@@ -347,12 +347,12 @@ MUTATIONS = [
         [("const std::size_t shown = (std::min)(size, limit);", "const std::size_t shown = size;")],
     ),
     (
-        "sinks.hpp",
+        "file_sink.hpp",
         "a refused rotation is retried on every line",
         [(" && size_ >= retry_rotation_at_) rotate();", ") rotate();")],
     ),
     (
-        "sinks.hpp",
+        "file_sink.hpp",
         "an open file sink is never published to the exit handler",
         [("      files.by_path[key].sink = sink;\n", "")],
         {"linux"},
@@ -452,10 +452,55 @@ MUTATIONS = [
     (
         "async_sink.hpp",
         "the async worker does not mark its sink as writing",
-        [("    const detail::WriteScope outer(this);\n", "")],
+        [
+            (
+                "    const detail::WriteScope outer(this);\n"
+                "    const detail::WriteScope inner(inner_.get());\n"
+                "    try {\n"
+                "      inner_->write(std::move(r));",
+                "    const detail::WriteScope inner(inner_.get());\n"
+                "    try {\n"
+                "      inner_->write(std::move(r));",
+            ),
+        ],
     ),
     (
-        "sinks.hpp",
+        "async_sink.hpp",
+        "droppable records take the slots a waiting kept record needs",
+        [
+            (
+                "    return policy_ == Overflow::kDrop && r.level < keep_from_ &&\n"
+                "           producers_waiting_.load(std::memory_order_relaxed) > 0;",
+                "    (void)r;\n"
+                "    return false;",
+            ),
+        ],
+    ),
+    (
+        "async_sink.hpp",
+        "the worker does not bracket its sweeps",
+        [
+            ("      bracket_inner([&] { inner_->begin_batch(); });\n", ""),
+            ("      bracket_inner([&] { inner_->end_batch(); });\n", ""),
+        ],
+    ),
+    (
+        "file_sink.hpp",
+        "a file sink flushes every flush_on line inside a sweep",
+        [
+            (
+                "        flush_pending_ = true;  // the worker's end_batch() flushes once for the whole sweep",
+                "        flush_locked();",
+            ),
+        ],
+    ),
+    (
+        "file_sink.hpp",
+        "the flush a sweep held back is never written",
+        [("    if (batches_open_ == 0 && flush_pending_) flush_locked();\n", "")],
+    ),
+    (
+        "file_sink.hpp",
         "a file held by another process is not refused",
         [
             (
@@ -466,7 +511,7 @@ MUTATIONS = [
         {"windows"},
     ),
     (
-        "sinks.hpp",
+        "file_sink.hpp",
         "a file held by another process is not refused",
         [
             (
@@ -477,7 +522,7 @@ MUTATIONS = [
         {"linux"},
     ),
     (
-        "sinks.hpp",
+        "file_sink.hpp",
         "the exit handler does not flush the open file sinks",
         [("    for (const auto& sink : live) sink->flush();\n", "")],
         {"linux"},
