@@ -432,8 +432,10 @@ class SummarySink final : public Sink {
   static std::error_code write_file(const std::filesystem::path& path, const std::string& object,
                                     bool exclusive, bool* created) {
     errno = 0;
-    auto mode = std::ios::out | std::ios::binary | std::ios::trunc;
-    if (exclusive) mode |= std::ios::noreplace;  // a temporary is ours alone, or not opened
+    // noreplace without trunc: a temporary is ours alone (new) or not opened, and libstdc++
+    // refuses the two together (there is nothing to truncate in a file that must be new).
+    const auto mode = exclusive ? std::ios::out | std::ios::binary | std::ios::noreplace
+                                : std::ios::out | std::ios::binary | std::ios::trunc;
     std::ofstream out(path, mode);
     if (created != nullptr) *created = out.is_open();
     if (!out.is_open()) return std::error_code(errno != 0 ? errno : EIO, std::generic_category());
