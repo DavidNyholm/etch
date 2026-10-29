@@ -129,6 +129,7 @@ TEST(the_summary_carries_the_run_id_the_pid_and_what_wrote_it) {
   CHECK(json.starts_with(std::format("{{\"etch_summary\":1,\"run_id\":\"{}\",\"pid\":{},",
                                      etch::run_id(), etch::detail::process_id())));
   CHECK(json.find("\"written_at\":\"call\"") != std::string::npos);
+  CHECK(json.find("\"report_failures\":") != std::string::npos);
   CHECK(summary.json("exit").find("\"written_at\":\"exit\"") != std::string::npos);
 }
 

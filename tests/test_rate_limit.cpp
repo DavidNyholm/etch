@@ -177,6 +177,15 @@ std::optional<std::int64_t> int_field(const etch::Record& r, std::string_view ke
   return std::nullopt;
 }
 
+std::optional<std::string> string_field(const etch::Record& r, std::string_view key) {
+  for (const auto& f : r.fields) {
+    if (f.key == key) {
+      if (const auto* s = std::get_if<std::string>(&f.value)) return *s;
+    }
+  }
+  return std::nullopt;
+}
+
 // Game testbed, finding 17: after 1,000 errors through every(1h) the summary said error=1 and
 // nothing reported the other 999. The count still pending is now written as one line in the
 // shape of the first held call: its level, logger, message and fields, plus `suppressed`.
@@ -193,6 +202,7 @@ TEST(held_back_counts_are_reported_in_the_first_held_calls_shape) {
   CHECK(held.level == etch::Level::kWarn);
   CHECK_EQ(held.logger_name, std::string("pending"));
   CHECK(suppressed_field(held) == std::optional<std::int64_t>{4});
+  CHECK(string_field(held, "report") == std::optional<std::string>{"held-back"});  // not a call
   CHECK(int_field(held, "frame") == std::optional<std::int64_t>{1});  // the held call's own
   CHECK(std::string_view(held.where.file_name()).ends_with("test_rate_limit.cpp"));
   etch::detail::report_pending_rates();  // reported once: the count started again at zero
@@ -252,6 +262,36 @@ TEST(held_hexdumps_and_scopes_are_reported_too) {
   for (const auto& r : records) {
     if (suppressed_field(r)) CHECK(suppressed_field(r) == std::optional<std::int64_t>{2});
   }
+}
+
+// Sink A logs through a gate into logger b, whose sink B logs back into logger c, whose sink
+// is A. The call held inside A's write carries A as its exclusion; when the report delivers
+// it to B after the fact, what B logs in response must still not reach A, exactly as the
+// admitted call's response did not (delivered after A's write returned, with A excluded).
+TEST(a_held_report_keeps_its_exclusions_through_a_relay) {
+  std::atomic<int> a_entered{0};
+  std::atomic<int> b_entered{0};
+  etch::Logger* log_b = nullptr;
+  etch::Logger* log_c = nullptr;
+  auto a = std::make_shared<etch::CallbackSink>([&](const etch::Record&) {
+    a_entered.fetch_add(1);
+    for (int i = 0; i < 3; ++i) log_b->every(1h).warn("from a {}", i);  // one through, two held
+  });
+  auto b = std::make_shared<etch::CallbackSink>([&](const etch::Record&) {
+    b_entered.fetch_add(1);
+    log_c->warn("echo");
+  });
+  etch::Logger logger_a{"relay-a", {a}};
+  etch::Logger logger_b{"relay-b", {b}};
+  etch::Logger logger_c{"relay-c", {a}};
+  log_b = &logger_b;
+  log_c = &logger_c;
+  logger_a.warn("trigger");
+  CHECK_EQ(a_entered.load(), 1);  // the echo of the admitted call did not come back to A
+  CHECK_EQ(b_entered.load(), 1);
+  etch::detail::report_pending_rates();
+  CHECK_EQ(b_entered.load(), 2);  // the held-back report reached B
+  CHECK_EQ(a_entered.load(), 1);  // and its echo did not come back to A either
 }
 
 TEST(a_logger_that_is_gone_takes_its_pending_count_with_it) {

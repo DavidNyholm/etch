@@ -53,11 +53,12 @@ namespace etch {
 // where it blocks instead: a game loop is never stalled by trace lines, and an error is never
 // thrown away. While such a record waits for room, droppable records are dropped at once
 // rather than queued, so the slots the worker frees go to the waiting record and not to the
-// flood that filled the ring; the wait is then about one sweep of the worker, however many
-// threads keep flooding (a droppable record already past that check can still take a slot,
-// so the bound is a sweep plus a few records, not a strict order). A droppable record that finds
-// the ring full yields once and looks again before it is dropped, so a worker short of CPU gets
-// some from the threads filling its ring. Whenever records were dropped, the worker writes one
+// flood that filled the ring. That is best effort, not an order: a droppable record already
+// past that check (paused between it and its claim) can still take a slot, so the kept
+// record's wait has no bound in sweeps, only a flood that no longer competes for the slots.
+// A droppable record that finds the ring full yields once and looks again before it is
+// dropped, so a worker short of CPU gets some from the threads filling its ring. Whenever
+// records were dropped, the worker writes one
 // warning from logger "etch" saying how many, before the next real record, when it goes idle, and
 // at shutdown, so the file shows where its gaps are and flush() never returns with a gap
 // unreported.
@@ -299,7 +300,7 @@ class AsyncSink final : public Sink {
   // Whether the worker got the priority it asked for (see WorkerPriority): false with
   // kInherit, in the child of a fork (no worker), after shutdown from the start, and on a
   // system that refused the raise. Waits for the worker to have started, a moment at most.
-  bool worker_priority_raised() {
+  bool worker_priority_raised() const {
     if (inherited() || worker_ == nullptr) return false;
     std::unique_lock lock(sync_->mutex);
     sync_->drained.wait(lock, [&] {
@@ -486,7 +487,8 @@ class AsyncSink final : public Sink {
     bool queued = !drop_now(r) && try_enqueue(r);
     if (!queued && policy_ == Overflow::kDrop && r.level < keep_from_ && !drop_now(r)) {
       // Full, and nothing kept is waiting for the slots: give the worker a turn, then look
-      // once more. One yield, so the caller is never stalled, only slowed by a scheduler tick
+      // once more. One yield, a scheduling point and not a latency bound (a descheduled
+      // thread returns when the scheduler says), so the caller is slowed by at most one turn
       // while the ring is full.
       std::this_thread::yield();
       queued = !drop_now(r) && try_enqueue(r);  // a kept record may have begun waiting meanwhile

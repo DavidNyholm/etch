@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -29,6 +30,16 @@ namespace etch::detail {
 // The count of held-back calls rides on the line that gets through, as a field of this name,
 // replacing any field of that name the caller supplied.
 inline constexpr std::string_view kSuppressedField = "suppressed";
+// A line written at shutdown for a count still held back carries this field with this value,
+// so a reader can tell it from a call that got through (both carry `suppressed`).
+inline constexpr std::string_view kReportField = "report";
+inline constexpr std::string_view kHeldBackReport = "held-back";
+
+// Report lines a sink threw on, lost for good; the run summary shows the count.
+inline std::atomic<std::size_t>& rate_report_failures() noexcept {
+  static std::atomic<std::size_t> failures{0};
+  return failures;
+}
 
 // A rate gate carried by a scope timer with a threshold: decided at the end, by the scopes
 // that turned out slow (see Logger::Entry::scope).
@@ -137,8 +148,8 @@ inline void note_pending_rate(PendingRate pending) {
 // exit handler call it, so "nothing held back is lost silently" holds at the end of a run as
 // well as while the site keeps logging. The lines are built under the registry lock and
 // delivered outside it, since a sink may itself log through a rate gate. Every line is
-// attempted; the first exception a sink threw is rethrown at the end, as a log call would
-// have thrown it.
+// attempted; a line a sink threw on is counted in rate_report_failures(), and the first such
+// exception is rethrown at the end, as a log call would have thrown it.
 inline void report_pending_rates() {
   std::vector<std::pair<Record, std::shared_ptr<const SinkList>>> due;
   {
@@ -158,7 +169,10 @@ inline void report_pending_rates() {
         r.message = std::move(state.pending->message);
         r.fields = std::move(state.pending->fields);
         r.lineage = std::move(state.pending->lineage);
-        std::erase_if(r.fields, [](const Field& f) { return f.key == kSuppressedField; });
+        std::erase_if(r.fields, [](const Field& f) {
+          return f.key == kSuppressedField || f.key == kReportField;
+        });
+        r.fields.emplace_back(kReportField, kHeldBackReport);
         r.fields.emplace_back(kSuppressedField, state.suppressed);
         due.emplace_back(std::move(r), sinks->snapshot());
       }
@@ -170,8 +184,12 @@ inline void report_pending_rates() {
   std::exception_ptr first_failure;
   for (auto& [r, sinks] : due) {
     try {
+      // What a sink logs in response inherits the held call's exclusions, as for any record
+      // delivered after the fact (see drain_deferred).
+      const AncestryScope ancestry(r);
       deliver_to(*sinks, std::move(r));
     } catch (...) {
+      rate_report_failures().fetch_add(1, std::memory_order_relaxed);
       if (first_failure == nullptr) first_failure = std::current_exception();
     }
   }

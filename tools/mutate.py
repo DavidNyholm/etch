@@ -172,6 +172,16 @@ MUTATIONS = [
         [('    if (r.level == Level::kFatal) write_now("fatal");\n', "")],
     ),
     (
+        "rate_limit.hpp",
+        "a held-back report is delivered without the held call's exclusions",
+        [("      const AncestryScope ancestry(r);\n", "")],
+    ),
+    (
+        "rate_limit.hpp",
+        "a held-back report is not marked as one",
+        [("        r.fields.emplace_back(kReportField, kHeldBackReport);\n", "")],
+    ),
+    (
         "async_sink.hpp",
         "shutdown does not report the held-back counts",
         [("      detail::report_pending_rates();\n", "")],
