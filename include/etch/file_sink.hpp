@@ -3,6 +3,7 @@
 // flushes every file sink still open.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstddef>
@@ -18,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -281,10 +283,10 @@ class FileSink final : public Sink {
     if (detail::process_exiting().load(std::memory_order_relaxed)) {
       flush_locked();  // a static destructor's line reaches the disk whatever else happens
     } else if (r.level >= options_.flush_on) {
-      if (batches_open_ > 0) {
+      if (in_sweep_on_this_thread()) {
         flush_pending_ = true;  // the worker's end_batch() flushes once for the whole sweep
       } else {
-        flush_locked();
+        flush_locked();  // a write of its own (a synchronous logger) is on disk on return
       }
     }
   }
@@ -292,16 +294,20 @@ class FileSink final : public Sink {
     std::lock_guard lock(mutex_);
     flush_locked();
   }
-  // A count rather than a flag: one file sink can sit behind two async sinks, whose sweeps
-  // may overlap.
+  // Only the sweeping thread's own writes are held: one file sink can sit behind two async
+  // sinks whose sweeps overlap, and a synchronous logger can share it with either. Every
+  // sweep's end serves the pending flush, so overlapping sweeps cannot postpone it between
+  // them.
   void begin_batch() override {
     std::lock_guard lock(mutex_);
-    ++batches_open_;
+    sweep_threads_.push_back(std::this_thread::get_id());
   }
   void end_batch() override {
     std::lock_guard lock(mutex_);
-    if (batches_open_ > 0) --batches_open_;
-    if (batches_open_ == 0 && flush_pending_) flush_locked();
+    const auto me =
+        std::find(sweep_threads_.begin(), sweep_threads_.end(), std::this_thread::get_id());
+    if (me != sweep_threads_.end()) sweep_threads_.erase(me);
+    if (flush_pending_) flush_locked();
   }
 
  private:
@@ -317,6 +323,11 @@ class FileSink final : public Sink {
 
   void count_failure() noexcept {
     counters_->write_failures.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  bool in_sweep_on_this_thread() const {  // under mutex_
+    return std::find(sweep_threads_.begin(), sweep_threads_.end(), std::this_thread::get_id()) !=
+           sweep_threads_.end();
   }
 
   void flush_locked() {
@@ -533,8 +544,8 @@ class FileSink final : public Sink {
   std::uintmax_t size_ = 0;
   std::uintmax_t retry_rotation_at_ = 0;  // no rotation attempt until size_ reaches this
   unsigned rotations_ = 0;
-  unsigned batches_open_ = 0;   // async sweeps in progress (begin_batch/end_batch)
-  bool flush_pending_ = false;  // a flush_on line was written inside a sweep
+  std::vector<std::thread::id> sweep_threads_;  // async workers inside a sweep of this sink
+  bool flush_pending_ = false;                  // a flush_on line was written inside a sweep
   mutable std::mutex mutex_;
 };
 

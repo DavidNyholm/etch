@@ -400,17 +400,23 @@ class Logger {
   friend class ScopeTimer;
 
   // The shape of a rate-limited call that was held back, for the report at shutdown (see
-  // detail::report_pending_rates): the line it would have written, minus the time.
+  // detail::report_pending_rates): the line it would have written, minus the time, with this
+  // thread's context fields and, when held from inside a sink's write, the sinks it must
+  // not reach.
   detail::PendingRate held_back(Level level, const std::source_location& where, std::string message,
-                                Fields fields) const {
-    return detail::PendingRate{.level = level,
-                               .logger = name_,
-                               .message = std::move(message),
-                               .fields = std::move(fields),
-                               .where = where,
-                               .thread = std::this_thread::get_id(),
-                               .thread_index = detail::this_thread_index(),
-                               .sinks = sinks_};
+                                Fields fields, std::uint64_t interval) const {
+    detail::append_context(fields);
+    return detail::PendingRate{
+        .level = level,
+        .logger = name_,
+        .message = std::move(message),
+        .fields = std::move(fields),
+        .where = where,
+        .thread = std::this_thread::get_id(),
+        .thread_index = detail::this_thread_index(),
+        .sinks = sinks_,
+        .lineage = detail::WriteScope::any() ? detail::current_lineage() : nullptr,
+        .interval = interval};
   }
 
   // Stamps and delivers without the level check: for a scope timer's end line, whose level was
@@ -524,11 +530,13 @@ inline ScopeTimer::~ScopeTimer() {
     if (took < options_.min_duration) return;
     if (gate_.gated) {  // a rate-gated threshold scope: the slow ones spend the budget
       std::uint64_t suppressed = 0;
-      const auto admission = detail::admit_rate(where_, gate_.interval, gate_.once, suppressed);
+      std::uint64_t interval = 0;
+      const auto admission =
+          detail::admit_rate(where_, gate_.interval, gate_.once, suppressed, interval);
       if (admission == detail::Admission::kHeldFirst) {
         detail::note_pending_rate(logger_.held_back(
             options_.level, where_, std::format("{}: done in {}", what_, format_duration(took)),
-            std::move(fields_)));
+            std::move(fields_), interval));
       }
       if (admission != detail::Admission::kAdmitted) return;
       if (suppressed > 0) {
@@ -699,7 +707,7 @@ class Logger::Entry {
   detail::Admission admit(const std::source_location& where) {
     if (!rate_gated_) return detail::Admission::kAdmitted;
     std::uint64_t suppressed = 0;
-    const auto admission = detail::admit_rate(where, interval_, once_, suppressed);
+    const auto admission = detail::admit_rate(where, interval_, once_, suppressed, held_interval_);
     if (admission == detail::Admission::kAdmitted && suppressed > 0) {
       std::erase_if(owned_, [](const Field& f) { return f.key == detail::kSuppressedField; });
       owned_.emplace_back(detail::kSuppressedField, suppressed);
@@ -709,7 +717,8 @@ class Logger::Entry {
   // The first held call's shape goes to the rate registry, fields included (the entry is used
   // up either way), for the report at shutdown.
   void note_held(Level level, const std::source_location& where, std::string message) {
-    detail::note_pending_rate(logger_.held_back(level, where, std::move(message), take()));
+    detail::note_pending_rate(
+        logger_.held_back(level, where, std::move(message), take(), held_interval_));
   }
 
   Logger& logger_;
@@ -718,6 +727,7 @@ class Logger::Entry {
   std::chrono::nanoseconds interval_{0};
   bool once_ = false;
   bool rate_gated_ = false;
+  std::uint64_t held_interval_ = 0;  // the gate's interval a held call belongs to
 };
 
 inline Logger::Entry Logger::with(std::initializer_list<Field> fields) & {

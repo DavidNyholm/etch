@@ -18,6 +18,7 @@
 #include "default_logger.hpp"
 #include "delivery.hpp"
 #include "file_sink.hpp"
+#include "gap_marker.hpp"
 #include "json.hpp"
 #include "level.hpp"
 #include "logger.hpp"

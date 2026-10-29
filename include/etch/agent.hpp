@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -75,11 +76,21 @@ inline AgentProfile agent_profile() { return AgentProfile{}; }
 // pid, so a reader can tell the runs apart in a file that several runs appended to and tie a
 // summary to the run it describes. A fork copies it: the child continues the parent's run.
 inline const std::string& run_id() {
-  static const std::string id = [] {
-    std::random_device source;
-    return std::format("{:08x}{:08x}", source(), source());
+  // Never destroyed: the summary's exit handler reads it after statics are gone. Never
+  // throws: a random source that fails (it may) gives way to the clock and the pid, which
+  // tell runs apart well enough for a log directory.
+  static const std::string* const id = [] {
+    try {
+      std::random_device source;
+      return new std::string(std::format("{:08x}{:08x}", source(), source()));
+    } catch (...) {
+      const auto ticks =
+          static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+      return new std::string(
+          std::format("{:016x}", ticks ^ (static_cast<std::uint64_t>(detail::process_id()) << 32)));
+    }
   }();
-  return id;
+  return *id;
 }
 
 // The record that starts a run in an agent file: "run started" from logger "etch", with the
@@ -111,7 +122,7 @@ inline Record run_started_record(std::source_location where = std::source_locati
   options.style = profile.style;  // the profile's style wins, so an edit to it is not lost
   auto file = FileSink::open(path, std::move(options));
   if (!file) return std::unexpected(file.error());
-  (*file)->write(run_started_record());
+  (*file)->write(run_started_record());  // also fixes the run id, here at setup time
   return std::make_shared<AsyncSink>(std::move(*file), profile.queue_capacity, profile.overflow,
                                      profile.keep_from, profile.worker_priority);
 }
@@ -248,19 +259,24 @@ class SummarySink final : public Sink {
   }
 
   // Writes the object and a newline to the file (replacing it), making missing parent
-  // directories like FileSink does. Returns the OS error if any.
+  // directories like FileSink does. Written to a temporary beside it and renamed over it, so
+  // a reader never sees a half-written object; where the rename is refused (a reader holding
+  // the file open on Windows) the file is rewritten in place. Returns the OS error if any.
   std::error_code write_to(const std::filesystem::path& path,
                            std::string_view written_at = "call") const {
     if (path.has_parent_path()) {
       std::error_code ec;
       std::filesystem::create_directories(path.parent_path(), ec);  // the open reports failure
     }
-    errno = 0;
-    std::ofstream out(path, std::ios::out | std::ios::binary | std::ios::trunc);
-    if (!out.is_open()) return std::error_code(errno != 0 ? errno : EIO, std::generic_category());
-    out << json(written_at) << '\n';
-    out.flush();
-    return out ? std::error_code{} : std::make_error_code(std::errc::io_error);
+    const std::string object = json(written_at);
+    std::filesystem::path temporary = path;
+    temporary += ".tmp";
+    if (const auto ec = write_file(temporary, object)) return ec;
+    std::error_code ec;
+    std::filesystem::rename(temporary, path, ec);
+    if (!ec) return {};
+    std::filesystem::remove(temporary, ec);
+    return write_file(path, object);
   }
 
   // Attaches a summary sink to the default logger (and so to every etch::get() logger),
@@ -275,6 +291,7 @@ class SummarySink final : public Sink {
       if (auto file = std::dynamic_pointer_cast<FileSink>(sink)) summary->watch(file);
     }
     default_logger().add_sink(summary);
+    (void)run_id();  // fixed here, at setup time, rather than inside a fatal's delivery
     auto& slot = installed();
     std::lock_guard lock(slot.mutex);
     slot.sink = summary;
@@ -288,6 +305,10 @@ class SummarySink final : public Sink {
       // first, so the drop counts are final.
       std::atexit([] {
         auto& s = installed();
+        // Seen by write_now() on any thread, this one included: a fatal delivered while the
+        // handler below reports the pending rates would otherwise try this very mutex from
+        // the thread that holds it.
+        s.exit_handler_running.store(true, std::memory_order_seq_cst);
         std::lock_guard l(s.mutex);
         if (s.sink == nullptr) return;
         // The child of a fork inherits this handler and the path: the summary is the parent's
@@ -303,6 +324,7 @@ class SummarySink final : public Sink {
         }
         flush_all();
         s.sink->flush_watched();
+        std::lock_guard writing(s.write_mutex);
         if (const auto ec = s.sink->write_to(s.path, "exit")) report_failure(s.path, ec);
       });
     }
@@ -311,11 +333,13 @@ class SummarySink final : public Sink {
 
  private:
   struct Installed {
-    std::mutex mutex;
+    std::mutex mutex;  // the fields below
     std::shared_ptr<SummarySink> sink;
     std::filesystem::path path;
     unsigned fork_generation = 0;  // the process the summary belongs to
     bool handler_registered = false;
+    std::atomic<bool> exit_handler_running{false};
+    std::mutex write_mutex;  // one writer of the file at a time (a fatal and exit may overlap)
   };
   // Never destroyed: the exit handler reads it after statics may be gone.
   static Installed& installed() {
@@ -329,19 +353,38 @@ class SummarySink final : public Sink {
   // object. The slot is only tried: the exit handler holds it while it waits for the
   // workers, and a worker blocking on it here would be the deadlock; the handler is writing
   // the file anyway.
-  void write_now(std::string_view written_at) {
+  void write_now(std::string_view written_at) noexcept {
     auto& slot = installed();
+    // The exit handler writes the final object itself, and may be the very thread this runs
+    // on (a pending-rate report delivering a held fatal): its mutex is not tried then.
+    if (slot.exit_handler_running.load(std::memory_order_seq_cst)) return;
     if (!slot.mutex.try_lock()) return;
     std::filesystem::path path;
-    {
-      std::lock_guard lock(slot.mutex, std::adopt_lock);
-      if (slot.sink.get() != this ||
-          slot.fork_generation != detail::fork_generation().load(std::memory_order_relaxed)) {
-        return;
+    try {
+      {
+        std::lock_guard lock(slot.mutex, std::adopt_lock);
+        if (slot.sink.get() != this ||
+            slot.fork_generation != detail::fork_generation().load(std::memory_order_relaxed)) {
+          return;
+        }
+        path = slot.path;
       }
-      path = slot.path;
+      std::lock_guard writing(slot.write_mutex);  // a bounded wait on file I/O, never a worker
+      if (const auto ec = write_to(path, written_at)) report_failure(path, ec);
+    } catch (...) {
+      // Out of memory building the object or copying the path: nothing may leave a sink's
+      // write for this, and the exit handler will try again.
+      report_failure(path, std::make_error_code(std::errc::not_enough_memory));
     }
-    if (const auto ec = write_to(path, written_at)) report_failure(path, ec);
+  }
+
+  static std::error_code write_file(const std::filesystem::path& path, const std::string& object) {
+    errno = 0;
+    std::ofstream out(path, std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) return std::error_code(errno != 0 ? errno : EIO, std::generic_category());
+    out << object << '\n';
+    out.flush();
+    return out ? std::error_code{} : std::make_error_code(std::errc::io_error);
   }
 
   // No logger to report to (the summary is a sink, and at exit none may be left): stderr is

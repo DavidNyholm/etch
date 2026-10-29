@@ -141,7 +141,7 @@ MUTATIONS = [
         "the first held call is never noted for the shutdown report",
         [
             (
-                "    return state.suppressed == 1 ? Admission::kHeldFirst : Admission::kHeld;",
+                "    return state.pending ? Admission::kHeld : Admission::kHeldFirst;",
                 "    return Admission::kHeld;",
             ),
         ],
@@ -159,17 +159,17 @@ MUTATIONS = [
     (
         "agent.hpp",
         "the agent log starts a run without a header record",
-        [("  (*file)->write(run_started_record());\n", "")],
+        [("  (*file)->write(run_started_record());  // also fixes the run id, here at setup time\n", "")],
     ),
     (
         "agent.hpp",
         "the summary carries an empty run id",
-        [("  json_string(run_id(), out);\n", "  json_string(\"\", out);\n")],
+        [("  json_string(run_id(), out);\n", '  json_string("", out);\n')],
     ),
     (
         "agent.hpp",
         "the installed summary is not written on a fatal",
-        [("    if (r.level == Level::kFatal) write_now(\"fatal\");\n", "")],
+        [('    if (r.level == Level::kFatal) write_now("fatal");\n', "")],
     ),
     (
         "async_sink.hpp",
@@ -509,8 +509,7 @@ MUTATIONS = [
             (
                 "    return policy_ == Overflow::kDrop && r.level < keep_from_ &&\n"
                 "           producers_waiting_.load(std::memory_order_relaxed) > 0;",
-                "    (void)r;\n"
-                "    return false;",
+                "    (void)r;\n    return false;",
             ),
         ],
     ),
@@ -546,7 +545,7 @@ MUTATIONS = [
     (
         "file_sink.hpp",
         "the flush a sweep held back is never written",
-        [("    if (batches_open_ == 0 && flush_pending_) flush_locked();\n", "")],
+        [("    if (flush_pending_) flush_locked();\n", "")],
     ),
     (
         "file_sink.hpp",

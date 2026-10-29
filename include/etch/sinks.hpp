@@ -58,10 +58,12 @@ class Sink {
   virtual void write(Record&& r) { write(static_cast<const Record&>(r)); }
   virtual void flush() {}
   // An async worker brackets each sweep of its ring with these, around the writes. A sink that
-  // flushes at a level (FileSink) holds that flush back until end_batch(), so an error storm
-  // costs one flush per sweep instead of one per line; the records waited in the ring for
-  // microseconds, so what a crash can lose is the same. An explicit flush() always flushes.
-  // The default does nothing; a sink that has no flush to hold back needs neither.
+  // flushes at a level (FileSink) holds that flush back for the writes of that sweep until
+  // end_batch(), so an error storm costs one flush per sweep instead of one per line. The
+  // price: a crash inside a sweep can lose the sweep's lines at or above flush_on written
+  // before it, where per-line flushing had them on disk; the window is one sweep of the
+  // worker. An explicit flush() always flushes. The default does nothing; a sink that has no
+  // flush to hold back needs neither.
   virtual void begin_batch() {}
   virtual void end_batch() {}
 
@@ -299,3 +301,7 @@ class CallbackSink final : public Sink {
 };
 
 }  // namespace etch
+
+// FileSink has always come with this header; it lives in its own file now, included last
+// because it needs the complete Sink.
+#include "file_sink.hpp"

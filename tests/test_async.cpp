@@ -592,16 +592,17 @@ TEST(the_worker_writes_every_sweep_inside_a_bracket) {
   CHECK_EQ(counter->begins.load(), counter->ends.load());
 }
 
-// Records what it gets, in order, after a parking phase: the worker sits inside the first
-// write until released, so the ring can be filled and a kept record made to wait.
-struct ParkedRecorder final : etch::Sink {
-  std::atomic<bool> released{false};
+// Records what it gets, in order, letting the n-th write through only once `allowed` has
+// reached n: the worker can be parked inside any chosen write, so the ring can be filled and
+// a kept record made to wait while the test decides when slots are freed.
+struct GatedRecorder final : etch::Sink {
+  std::atomic<int> allowed{0};
   std::atomic<int> entered{0};
   std::mutex mutex;
   std::vector<std::string> messages;
   void write(const etch::Record& r) override {
-    entered.fetch_add(1);
-    while (!released.load()) std::this_thread::sleep_for(1ms);
+    const int mine = entered.fetch_add(1) + 1;
+    while (allowed.load() < mine) std::this_thread::sleep_for(1ms);
     std::lock_guard lock(mutex);
     messages.push_back(r.message);
   }
@@ -610,9 +611,12 @@ struct ParkedRecorder final : etch::Sink {
 // Finding 2 of the server testbed: a warning waiting for a slot lost the race to the flood of
 // droppable records that kept taking the freed slots, for up to seconds. Now the flood is
 // dropped while a kept record waits, so the kept record is in the ring before any flood
-// record logged after it began waiting.
+// record logged after it began waiting. The worker is parked again right after the sweep
+// that frees the slots, so without the rule the flood (already in its loop) takes both slots
+// while the kept producer is still waking, and the order shows it.
 TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
-  auto held = std::make_shared<ParkedRecorder>();
+  constexpr int kFlood = 2000;
+  auto held = std::make_shared<GatedRecorder>();
   auto async = std::make_shared<etch::AsyncSink>(held, 2, etch::AsyncSink::Overflow::kDrop,
                                                  etch::Level::kError);
   etch::Logger log{"reserve", {async}};
@@ -620,12 +624,15 @@ TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
   for (int i = 0; i < 5000 && held->entered.load() < 1; ++i) std::this_thread::sleep_for(1ms);
   CHECK_EQ(held->entered.load(), 1);
   log.warn("slot one");
-  log.warn("slot two");                           // the ring is full and the worker is parked
+  log.warn("slot two");  // the ring is full and the worker is parked in the first write
   std::jthread kept([&] { log.error("kept"); });  // at keep_from: waits for a slot
   for (int i = 0; i < 5000 && async->waiting() < 1; ++i) std::this_thread::sleep_for(1ms);
   CHECK_EQ(async->waiting(), 1u);
-  held->released = true;
-  for (int i = 0; i < 2000; ++i) log.warn("flood {}", i);  // droppable, from now on
+  // The worker finishes the first write, sweeps both slots (freeing them) and parks in the
+  // second write. The flood runs while the kept producer is waking up.
+  held->allowed = 1;
+  for (int i = 0; i < kFlood; ++i) log.warn("flood {}", i);
+  held->allowed = 1 << 20;  // let everything through
   kept.join();
   async->flush();
   std::lock_guard lock(held->mutex);
@@ -635,6 +642,9 @@ TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
       std::ranges::find_if(got, [](const std::string& m) { return m.starts_with("flood "); });
   CHECK(kept_at != got.end());
   CHECK(kept_at < first_flood);  // also holds when no flood record was delivered at all
+  const auto flood_delivered = static_cast<std::size_t>(
+      std::ranges::count_if(got, [](const std::string& m) { return m.starts_with("flood "); }));
+  CHECK_EQ(flood_delivered + async->dropped(), static_cast<std::size_t>(kFlood));
   CHECK_EQ(async->waiting(), 0u);
 }
 

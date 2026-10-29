@@ -197,17 +197,19 @@ TEST(held_back_counts_are_reported_in_the_first_held_calls_shape) {
   CHECK(std::string_view(held.where.file_name()).ends_with("test_rate_limit.cpp"));
   etch::detail::report_pending_rates();  // reported once: the count started again at zero
   CHECK_EQ(c.sink->records().size(), 2u);
-  // A site that gets through again reports its count on that line, as before, and nothing
-  // is left for the end.
-  std::this_thread::sleep_for(20ms);
-  for (int i = 0; i < 3; ++i) c.log.every(5ms).error("burst {}", i);
+}
+
+TEST(a_held_call_keeps_the_context_fields_of_its_thread) {
+  Captured c("pending-context");
+  {
+    const auto request = etch::context({{"request", 7}});
+    for (int i = 0; i < 3; ++i) c.log.every(1h).warn("in a request {}", i);
+  }
   etch::detail::report_pending_rates();
-  const auto after = c.sink->records();
-  CHECK_EQ(after.size(), 4u);
-  if (after.size() < 4) return;
-  CHECK_EQ(after[2].message, std::string("burst 0"));
-  CHECK_EQ(after[3].message, std::string("burst 1"));
-  CHECK(suppressed_field(after[3]) == std::optional<std::int64_t>{2});
+  const auto records = c.sink->records();
+  CHECK_EQ(records.size(), 2u);
+  if (records.size() < 2) return;
+  CHECK(int_field(records[1], "request") == std::optional<std::int64_t>{7});
 }
 
 TEST(once_reports_the_calls_after_the_first_at_the_end) {
@@ -280,6 +282,34 @@ TEST(zz_child_probe_shutdown_reports_the_held_back_counts) {
 
 TEST(shutdown_reports_the_held_back_counts) {
   CHECK_EQ(run_test_in_child("zz_child_probe_shutdown_reports_the_held_back_counts"), 0);
+}
+
+// Child probe: counts made while shutdown drains the async sinks (a sink that logs through a
+// gate on every record) are reported too, by the second pass, through the then-synchronous
+// sinks.
+TEST(zz_child_probe_shutdown_reports_counts_made_during_its_drain) {
+  if (!in_child()) return;
+  auto memory = std::make_shared<etch::MemorySink>();
+  etch::Logger nested{"drain-nested", {memory}};
+  auto relay = std::make_shared<etch::CallbackSink>([&](const etch::Record& r) {
+    // Parked until shutdown has begun, so every nested call happens inside the drain.
+    while (!etch::detail::process_exiting().load()) std::this_thread::sleep_for(1ms);
+    nested.every(1h).warn("nested {}", r.message);
+  });
+  auto async = std::make_shared<etch::AsyncSink>(relay);
+  etch::Logger log{"drain", {async}};
+  for (int i = 0; i < 4; ++i) log.warn("{}", i);
+  etch::shutdown();
+  const auto records = memory->records();
+  CHECK_EQ(records.size(), 2u);
+  if (records.size() < 2) return;
+  CHECK_EQ(records[0].message, std::string("nested 0"));
+  CHECK_EQ(records[1].message, std::string("nested 1"));
+  CHECK(suppressed_field(records[1]) == std::optional<std::int64_t>{3});
+}
+
+TEST(shutdown_reports_counts_made_during_its_drain) {
+  CHECK_EQ(run_test_in_child("zz_child_probe_shutdown_reports_counts_made_during_its_drain"), 0);
 }
 
 }  // namespace

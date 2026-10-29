@@ -149,21 +149,51 @@ TEST(zz_child_probe_the_installed_summary_is_written_on_a_fatal) {
   if (at_fatal.empty()) return;
   CHECK(at_fatal[0].find("\"written_at\":\"fatal\"") != std::string::npos);
   CHECK(at_fatal[0].find("\"fatal\":1") != std::string::npos);  // the fatal itself is counted
+  CHECK(at_fatal[0].find(std::format("\"run_id\":\"{}\"", etch::run_id())) != std::string::npos);
+  // Kept beside the file for the parent: the exit handler replaces the original.
+  std::filesystem::copy_file(path, path.string() + ".fatal",
+                             std::filesystem::copy_options::overwrite_existing);
   etch::warn("after the fatal");  // the exit handler's object will have it; this one does not
   CHECK(at_fatal[0].find("\"records\":2") != std::string::npos);
 }
 
+// The run id in a summary object, or an empty string.
+std::string run_id_in(const std::string& json) {
+  const auto key = json.find("\"run_id\":\"");
+  if (key == std::string::npos) return {};
+  const auto start = key + 10;
+  const auto end = json.find('"', start);
+  return end == std::string::npos ? std::string{} : json.substr(start, end - start);
+}
+
+bool is_hex_id(const std::string& id) {
+  return id.size() == 16 &&
+         std::ranges::all_of(id, [](unsigned char c) { return std::isxdigit(c) != 0; });
+}
+
+// Two processes, each: the fatal summary and the exit summary carry one id, a valid one (the
+// id must outlive the statics the exit handler runs after); and the two processes' ids differ.
 TEST(the_installed_summary_is_written_on_a_fatal_and_again_at_exit) {
-  const auto path = scratch_dir() / "fatal-summary.json";
-  const std::string path_utf8 = etch::utf8(path);
-  CHECK_EQ(run_test_in_child("zz_child_probe_the_installed_summary_is_written_on_a_fatal",
-                             {{"ETCH_TEST_SUMMARY_PATH", path_utf8.c_str()}}),
-           0);
-  const auto at_exit = read_lines(path);
-  CHECK_EQ(at_exit.size(), 1u);
-  if (at_exit.empty()) return;
-  CHECK(at_exit[0].find("\"written_at\":\"exit\"") != std::string::npos);
-  CHECK(at_exit[0].find("\"records\":3") != std::string::npos);
+  std::vector<std::string> ids;
+  for (int run = 0; run < 2; ++run) {
+    const auto path = scratch_dir() / std::format("fatal-summary-{}.json", run);
+    const std::string path_utf8 = etch::utf8(path);
+    CHECK_EQ(run_test_in_child("zz_child_probe_the_installed_summary_is_written_on_a_fatal",
+                               {{"ETCH_TEST_SUMMARY_PATH", path_utf8.c_str()}}),
+             0);
+    const auto at_exit = read_lines(path);
+    const auto at_fatal = read_lines(path.string() + ".fatal");
+    CHECK_EQ(at_exit.size(), 1u);
+    CHECK_EQ(at_fatal.size(), 1u);
+    if (at_exit.empty() || at_fatal.empty()) return;
+    CHECK(at_exit[0].find("\"written_at\":\"exit\"") != std::string::npos);
+    CHECK(at_exit[0].find("\"records\":3") != std::string::npos);
+    const auto id = run_id_in(at_exit[0]);
+    CHECK(is_hex_id(id));
+    CHECK_EQ(run_id_in(at_fatal[0]), id);
+    ids.push_back(id);
+  }
+  CHECK(ids.size() == 2 && ids[0] != ids[1]);
 }
 
 TEST(summary_counts_levels_loggers_and_remembers_first_and_last_error) {
