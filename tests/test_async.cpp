@@ -334,8 +334,10 @@ TEST(async_drop_keeps_records_at_or_above_keep_from_and_marks_the_gap) {
       ++markers;
       CHECK(r.level == etch::Level::kWarn);
       CHECK(r.message.find("records dropped") != std::string::npos);
-      CHECK_EQ(r.fields.size(), 1u);
+      CHECK_EQ(r.fields.size(), 2u);  // dropped, and the reserved etch=gap marker
       if (!r.fields.empty()) marked_total += std::get<std::int64_t>(r.fields[0].value);
+      CHECK(r.fields.size() == 2 && r.fields[1].key == "etch" &&
+            std::get<std::string>(r.fields[1].value) == "gap");
     }
   }
   CHECK(error_seen);
@@ -669,7 +671,13 @@ TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
         admitted_in_budget = true;  // decided here, not recomputed from a flood that goes on
         break;
       }
-      if (next.load() - budget_start >= kFloodCap) break;
+      if (next.load() - budget_start >= kFloodCap) {
+        // Looked at once more: this thread may have been away while the kept record got in
+        // and the flood spent the budget afterwards. An observation, not an instrumented
+        // ordering: a kept record admitted after the budget but before this look passes too.
+        admitted_in_budget = async->waiting() == 0;
+        break;
+      }
       std::this_thread::yield();
     }
     stop = true;

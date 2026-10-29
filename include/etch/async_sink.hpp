@@ -26,6 +26,10 @@
 
 namespace etch {
 
+namespace detail {
+void shutdown_all(bool at_exit) noexcept;  // async_control.hpp
+}  // namespace detail
+
 #if defined(_MSC_VER)
 // C4324: "structure was padded due to alignment specifier". The padding is the point: the hot
 // counters below are placed on separate cache lines so producers and the worker do not false-share.
@@ -386,7 +390,7 @@ class AsyncSink final : public Sink {
       // On std::exit (or a return from main) every live async sink is drained and switched to
       // synchronous writes, so records queued before exit reach their sink and lines logged by
       // static destructors afterwards go straight through.
-      std::atexit([] { shutdown_all(); });
+      std::atexit([] { detail::shutdown_all(/*at_exit=*/true); });
     }
   }
   void unregister_self() noexcept {
@@ -723,43 +727,7 @@ class AsyncSink final : public Sink {
   // synchronous by then, so that second report lands at once. What that second report's own
   // lines hold back in turn (a sink that logs through a gate on every write) is the one
   // count that is not reported.
-  static void shutdown_all() noexcept {
-    report_pending_rates_at_shutdown();
-    detail::process_exiting().store(true, std::memory_order_relaxed);
-    // One entry at a time, claimed under the registry lock and shut down outside it, so no
-    // allocation is needed (nothing may throw here) and no sink is joined while the lock is
-    // held (a callback of the sink being drained may destroy another sink, whose destructor
-    // takes the lock). A sink registered while this runs is claimed on a later turn; one
-    // claimed by an earlier shutdown_all() is already shut down.
-    for (;;) {
-      std::shared_ptr<detail::AsyncEntry> entry;
-      {
-        auto& registry = detail::async_registry();
-        std::lock_guard lock(registry.mutex);
-        for (const auto& candidate : registry.live) {
-          if (!candidate->shutdown_requested.exchange(true, std::memory_order_acq_rel)) {
-            entry = candidate;
-            break;
-          }
-        }
-      }
-      if (entry == nullptr) break;
-      std::lock_guard entry_lock(entry->mutex);
-      if (AsyncSink* sink = entry->sink.load(std::memory_order_relaxed)) sink->shutdown();
-    }
-    report_pending_rates_at_shutdown();
-  }
-  static void report_pending_rates_at_shutdown() noexcept {
-    try {
-      detail::report_pending_rates();
-    } catch (...) {
-      // A sink threw on one of those lines (or memory ran out building them): at shutdown
-      // there is nothing left to tell; the other lines were still attempted.
-    }
-  }
-
   friend void flush_all();
-  friend void shutdown();
   friend void prepare_fork();
 
   std::shared_ptr<Sink> inner_;

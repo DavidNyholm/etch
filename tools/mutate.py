@@ -188,9 +188,9 @@ MUTATIONS = [
         [("      r.fields.emplace_back(kEtchField, kHeldBackReport);\n", "")],
     ),
     (
-        "async_sink.hpp",
+        "async_control.hpp",
         "shutdown does not report the held-back counts",
-        [("      detail::report_pending_rates();\n", "")],
+        [("    report_pending_rates();\n", "")],
     ),
     (
         "logger.hpp",

@@ -42,9 +42,23 @@ struct AsyncRegistry {
   std::vector<std::shared_ptr<AsyncEntry>> live;
   bool exit_handler_installed = false;
 };
+// The registry is made on first use and never destroyed. registry_if_made() hands it out
+// without making it, for the exit handlers, which may not allocate: no registry means no
+// sink was ever made, so there is nothing to drain.
+inline std::atomic<AsyncRegistry*>& async_registry_slot() noexcept {
+  static std::atomic<AsyncRegistry*> slot{nullptr};
+  return slot;
+}
 inline AsyncRegistry& async_registry() {
-  static AsyncRegistry* const registry = new AsyncRegistry;
+  static AsyncRegistry* const registry = [] {
+    auto* made = new AsyncRegistry;
+    async_registry_slot().store(made, std::memory_order_release);
+    return made;
+  }();
   return *registry;
+}
+inline AsyncRegistry* async_registry_if_made() noexcept {
+  return async_registry_slot().load(std::memory_order_acquire);
 }
 
 // Counts the forks this process has been through, so a sink can tell whether it was made in

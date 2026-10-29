@@ -72,6 +72,7 @@ inline Record gap_marker_record(std::size_t gap, Level level,
   marker.message =
       std::format("{} records dropped by the async queue since the previous report", gap);
   marker.fields.emplace_back("dropped", gap);
+  marker.fields.emplace_back(kEtchField, "gap");  // after `dropped`, which 0.4 readers index
   marker.ancestry = std::move(ancestry);
   return marker;
 }

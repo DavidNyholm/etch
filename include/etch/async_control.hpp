@@ -5,9 +5,13 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 
 #include "async_registry.hpp"
 #include "async_sink.hpp"
+#include "rate_limit.hpp"
+#include "record.hpp"
 
 namespace etch {
 
@@ -19,10 +23,63 @@ inline void flush_all() {
   AsyncSink::for_each_live([](AsyncSink& sink) { sink.flush(); });
 }
 
+namespace detail {
+
+inline std::atomic<bool>& exit_reports_made() noexcept {
+  static std::atomic<bool> made{false};
+  return made;
+}
+inline void report_pending_rates_at_shutdown() noexcept {
+  try {
+    report_pending_rates();
+  } catch (...) {
+    // A sink threw on one of those lines (or memory ran out building them): at shutdown
+    // there is nothing left to tell; the other lines were still attempted.
+  }
+}
+
+// `at_exit`: called from an exit handler. The held-back reports are then made once in the
+// process, by whichever handler gets here first (the run summary's, which writes its file
+// right after, or the async sinks' own): a later handler drains what is left but reports
+// nothing more, so a summary file never misses lines that were reported after it was
+// written. etch::shutdown() called by the program reports every time and leaves the
+// exit-time reports to the handlers.
+inline void shutdown_all(bool at_exit) noexcept {
+  const bool report = !at_exit || !exit_reports_made().exchange(true, std::memory_order_acq_rel);
+  if (report) report_pending_rates_at_shutdown();
+  process_exiting().store(true, std::memory_order_relaxed);
+  // One entry at a time, claimed under the registry lock and shut down outside it, so no
+  // allocation is needed (nothing may throw here) and no sink is joined while the lock is
+  // held (a callback of the sink being drained may destroy another sink, whose destructor
+  // takes the lock). A sink registered while this runs is claimed on a later turn; one
+  // claimed by an earlier shutdown_all() is already shut down. With no registry at all no
+  // sink was ever made, and the registry is not made here (that would allocate).
+  for (;;) {
+    std::shared_ptr<AsyncEntry> entry;
+    {
+      AsyncRegistry* const registry = async_registry_if_made();
+      if (registry == nullptr) break;
+      std::lock_guard lock(registry->mutex);
+      for (const auto& candidate : registry->live) {
+        if (!candidate->shutdown_requested.exchange(true, std::memory_order_acq_rel)) {
+          entry = candidate;
+          break;
+        }
+      }
+    }
+    if (entry == nullptr) break;
+    std::lock_guard entry_lock(entry->mutex);
+    if (AsyncSink* sink = entry->sink.load(std::memory_order_relaxed)) sink->shutdown();
+  }
+  if (report) report_pending_rates_at_shutdown();
+}
+
+}  // namespace detail
+
 // Drains and stops every async worker and marks the process as exiting, after which every
 // async sink writes straight through and file sinks flush every line. Call it once at the end
 // of main; it also runs automatically from an exit handler. Not from inside a sink.
-inline void shutdown() { AsyncSink::shutdown_all(); }
+inline void shutdown() { detail::shutdown_all(/*at_exit=*/false); }
 
 // For a program that forks after setting up its logging: waits until every async worker has
 // written everything, flushed its sink and gone to sleep, so that the fork copies no lock of
