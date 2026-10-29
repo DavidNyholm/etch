@@ -613,10 +613,12 @@ struct GatedRecorder final : etch::Sink {
 // dropped while a kept record waits, so the kept record is in the ring before any flood
 // record logged after it began waiting. The worker is parked again right after the sweep
 // that frees the slots, so without the rule the flood (already in its loop) takes both slots
-// while the kept producer is still waking, and the order shows it.
+// while the kept producer is still waking, the kept producer keeps waiting, and the flood
+// runs to its cap.
 TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
   constexpr int kFlood = 2000;        // at least this many, and until the kept record is in
   constexpr int kFloodCap = 1 << 20;  // bounded, so a broken reservation fails, not hangs
+  constexpr int kFlooders = 4;
   auto held = std::make_shared<GatedRecorder>();
   auto async = std::make_shared<etch::AsyncSink>(held, 2, etch::AsyncSink::Overflow::kDrop,
                                                  etch::Level::kError);
@@ -629,17 +631,45 @@ TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
   std::jthread kept([&] { log.error("kept"); });  // at keep_from: waits for a slot
   for (int i = 0; i < 5000 && async->waiting() < 1; ++i) std::this_thread::sleep_for(1ms);
   CHECK_EQ(async->waiting(), 1u);
-  // Two more writes: the worker finishes the first, reports the flood's first drops as a gap
-  // marker (a write of its own) if the flood has begun, sweeps both slots (freeing them) and
-  // parks again by its third write at the latest. The flood runs while the kept producer is
-  // waking up.
-  held->allowed = 2;
-  // The ring is still full when the flood starts (the worker wakes on a millisecond sleep),
-  // so the flood must outlast the freeing sweep: it runs until the kept record is in.
-  int sent = 0;
-  for (; sent < kFlood || (async->waiting() > 0 && sent < kFloodCap); ++sent) {
-    log.warn("flood {}", sent);
-  }
+  // The flood: several threads, because one flooder yields on every full ring (the retry
+  // path) and so hands the CPU to the waking kept producer, which would then win the slot
+  // without any reservation. With four spinning flooders the kept producer's wake-up
+  // (microseconds) cannot beat their next claim (a fraction of one) unless the reservation
+  // holds them off. Started before the worker is released, and only released once they are
+  // demonstrably dropping, so the slots free under a live flood; the flood then runs until
+  // the kept record is in.
+  std::atomic<bool> stop{false};
+  std::atomic<int> next{0};
+  std::atomic<int> issued{0};
+  {
+    std::vector<std::jthread> flooders;
+    for (int t = 0; t < kFlooders; ++t) {
+      flooders.emplace_back([&] {
+        int mine = 0;
+        while (!stop.load()) {
+          const int n = next.fetch_add(1);
+          if (n >= kFloodCap) break;
+          log.warn("flood {}", n);
+          ++mine;
+          if (n >= kFlood && async->waiting() == 0) stop = true;
+        }
+        issued.fetch_add(mine);
+      });
+    }
+    for (int i = 0; i < 5000 && async->dropped() < 100; ++i) std::this_thread::sleep_for(1ms);
+    CHECK(async->dropped() >= 100);  // the flood is on, against a full ring
+    // Two more writes: the worker finishes the first, reports the flood's drops as a gap
+    // marker (a write of its own), sweeps both slots (freeing them, and waking the kept
+    // producer) and parks again at its third write, the next marker.
+    held->allowed = 2;
+  }  // the flooders are joined here
+  const int sent = issued.load();
+  // The kept record got in while the flood was still running, not after it gave up: with
+  // the reservation removed, the flood takes the freed slots and runs to the cap. Stress
+  // coverage, not a proof: a schedule that deschedules every flooder at the moment the slots
+  // free passes either way, and the retry window itself has no hook to pin it.
+  CHECK(sent < kFloodCap);
+  CHECK_EQ(async->waiting(), 0u);
   held->allowed = 1 << 20;  // let everything through
   kept.join();
   async->flush();

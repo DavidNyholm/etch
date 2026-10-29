@@ -267,36 +267,36 @@ class SummarySink final : public Sink {
   }
 
   // Writes the object and a newline to the file (replacing it), making missing parent
-  // directories like FileSink does. Written to a temporary of its own beside it (a name no
-  // other writer uses, created exclusively, given the destination's permissions when one
-  // exists) and renamed over it, so a reader never sees a half-written object; where the
-  // rename is refused (a reader holding the file open on Windows) the file is rewritten in
-  // place. One write of this sink's file at a time. Returns the OS error if any.
+  // directories like FileSink does. When no file exists yet it is written to a temporary of
+  // its own beside it (a name no other writer uses, created exclusively) and renamed into
+  // place, so a reader never sees a half-written object. When a file exists it is rewritten
+  // in place: that keeps its mode (a summary made 0600 stays 0600, and is never exposed
+  // through a temporary with the default mode), at the price that a reader can see the
+  // object half-written for the microseconds of the write, as in 0.4. Summary writes to any
+  // path are serialised process-wide, so two summaries on one path cannot interleave in it.
+  // Returns the OS error if any.
   std::error_code write_to(const std::filesystem::path& path,
                            std::string_view written_at = "call") const {
-    std::lock_guard writing(file_mutex_);
+    std::lock_guard writing(summary_file_mutex());
     if (path.has_parent_path()) {
       std::error_code ec;
       std::filesystem::create_directories(path.parent_path(), ec);  // the open reports failure
     }
     const std::string object = json(written_at);
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec)) return write_file(path, object, /*exclusive=*/false);
     static std::atomic<unsigned> temporaries{0};
     std::filesystem::path temporary = path;
     temporary += std::format(".{}.{}.tmp", detail::process_id(),
                              temporaries.fetch_add(1, std::memory_order_relaxed));
-    std::error_code ec;
-    const auto existing = std::filesystem::status(path, ec);
-    const bool had_file = !ec && std::filesystem::is_regular_file(existing);
-    if (const auto write_ec = write_file(temporary, object, /*exclusive=*/true)) return write_ec;
-    if (had_file) {
-      // The replacement keeps the file's mode (a summary made 0600 stays 0600); a failure
-      // here is the rename's problem to report, so the error is not read.
-      std::filesystem::permissions(temporary, existing.permissions(), ec);
+    if (const auto write_ec = write_file(temporary, object, /*exclusive=*/true)) {
+      std::filesystem::remove(temporary, ec);
+      return write_ec;
     }
     std::filesystem::rename(temporary, path, ec);
     if (!ec) return {};
     std::filesystem::remove(temporary, ec);
-    return write_file(path, object, /*exclusive=*/false);
+    return write_file(path, object, /*exclusive=*/false);  // refused rename: in place after all
   }
 
   // Attaches a summary sink to the default logger (and so to every etch::get() logger),
@@ -344,12 +344,14 @@ class SummarySink final : public Sink {
     return *slot;
   }
 
-  // The exit handler: reports what the rate gates hold back, drains the async sinks, reports
-  // again (the drain runs sinks that may log through a gate) and drains again, flushes the
-  // watched files and writes the final object. While it runs, write_now() stands aside (it
-  // may be called on this very thread, by a held fatal the report delivers); once it is done
-  // a later fatal (another exit handler's) updates the file again. Nothing may throw out of
-  // an exit handler, so the whole of it is guarded.
+  // The exit handler. It runs etch::shutdown(): the held-back counts are reported, every
+  // async worker is closed and drained in turn (so work queued behind another async sink is
+  // drained too, not merely flushed once), the counts made by that drain are reported through
+  // the then-synchronous sinks, and only then are the watched files flushed and the final
+  // object written. The async exit handler that follows finds nothing left to do. While this
+  // runs, write_now() stands aside (it may be called on this very thread, by a held fatal the
+  // report delivers); once it is done a later fatal (another exit handler's) updates the file
+  // again. Nothing may throw out of an exit handler, so the whole of it is guarded.
   static void write_at_exit() noexcept {
     auto& s = installed();
     s.exit_handler_running.store(true, std::memory_order_seq_cst);
@@ -359,10 +361,7 @@ class SummarySink final : public Sink {
       // run, so the child leaves it alone (it installs its own if it wants one).
       if (s.sink != nullptr &&
           s.fork_generation == detail::fork_generation().load(std::memory_order_relaxed)) {
-        report_pending_rates_guarded();
-        flush_all();
-        report_pending_rates_guarded();
-        flush_all();
+        shutdown();
         s.sink->flush_watched();
         if (const auto ec = s.sink->write_to(s.path, "exit")) report_failure(s.path, ec);
       }
@@ -370,14 +369,6 @@ class SummarySink final : public Sink {
       report_failure(s.path, std::make_error_code(std::errc::not_enough_memory));
     }
     s.exit_handler_running.store(false, std::memory_order_seq_cst);
-  }
-
-  static void report_pending_rates_guarded() noexcept {
-    try {
-      detail::report_pending_rates();
-    } catch (...) {
-      // A sink threw on a report line: counted in report_failures, nothing more to do here.
-    }
   }
 
   // Writes the installed summary's file at once, if this is it, holding the slot for the
@@ -390,8 +381,14 @@ class SummarySink final : public Sink {
   // before the try: the handler may be this very thread).
   void write_now(std::string_view written_at) noexcept {
     auto& slot = installed();
-    if (slot.exit_handler_running.load(std::memory_order_seq_cst)) return;
-    if (!slot.mutex.try_lock()) return;
+    // Whoever holds the slot is either the exit handler (then this stands aside: it writes
+    // the final object, and may be this very thread), install() for an instant, or another
+    // fatal's writer in its file I/O; waiting for the last two is bounded and never waits for
+    // a worker, and it is what keeps a second fatal's counts out of an older object.
+    while (!slot.mutex.try_lock()) {
+      if (slot.exit_handler_running.load(std::memory_order_seq_cst)) return;
+      std::this_thread::yield();
+    }
     std::lock_guard lock(slot.mutex, std::adopt_lock);
     try {
       if (slot.sink.get() != this ||
@@ -404,6 +401,13 @@ class SummarySink final : public Sink {
       // the exit handler will try again.
       report_failure(slot.path, std::make_error_code(std::errc::not_enough_memory));
     }
+  }
+
+  // One writer of any summary file at a time, across every SummarySink: two summaries on one
+  // path (a reinstall, a program's own write_to) must not interleave in the file.
+  static std::mutex& summary_file_mutex() {
+    static std::mutex* const mutex = new std::mutex;  // never destroyed: used at exit
+    return *mutex;
   }
 
   static std::error_code write_file(const std::filesystem::path& path, const std::string& object,
@@ -457,7 +461,6 @@ class SummarySink final : public Sink {
   std::vector<std::shared_ptr<const detail::SinkCounters>> watched_;
   std::vector<std::weak_ptr<FileSink>> watched_files_;
   mutable std::mutex mutex_;
-  mutable std::mutex file_mutex_;  // one write_to() of this sink at a time
 };
 
 }  // namespace etch

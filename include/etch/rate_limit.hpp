@@ -155,28 +155,32 @@ inline void report_pending_rates() {
   {
     RateRegistry& registry = rate_registry();
     std::lock_guard lock(registry.mutex);
+    // Built by copying first, reset afterwards: if memory runs out halfway through, no site
+    // has lost its count or its representative, and the next report starts over.
     for (auto& [key, state] : registry.sites) {
       if (state.suppressed == 0 || !state.pending) continue;
       const std::shared_ptr<SinkSet> sinks = state.pending->sinks.lock();
-      if (sinks != nullptr) {
-        Record r;
-        r.level = state.pending->level;
-        r.time = std::chrono::system_clock::now();
-        r.thread = state.pending->thread;
-        r.thread_index = state.pending->thread_index;
-        r.where = state.pending->where;
-        r.logger_name = std::move(state.pending->logger);
-        r.message = std::move(state.pending->message);
-        r.fields = std::move(state.pending->fields);
-        r.lineage = std::move(state.pending->lineage);
-        std::erase_if(r.fields, [](const Field& f) {
-          return f.key == kSuppressedField || f.key == kReportField;
-        });
-        r.fields.emplace_back(kReportField, kHeldBackReport);
-        r.fields.emplace_back(kSuppressedField, state.suppressed);
-        due.emplace_back(std::move(r), sinks->snapshot());
-      }
-      state.suppressed = 0;
+      if (sinks == nullptr) continue;
+      Record r;
+      r.level = state.pending->level;
+      r.time = std::chrono::system_clock::now();
+      r.thread = state.pending->thread;
+      r.thread_index = state.pending->thread_index;
+      r.where = state.pending->where;
+      r.logger_name = state.pending->logger;
+      r.message = state.pending->message;
+      r.fields = state.pending->fields;
+      r.lineage = state.pending->lineage;
+      std::erase_if(r.fields, [](const Field& f) {
+        return f.key == kSuppressedField || f.key == kReportField;
+      });
+      r.fields.emplace_back(kReportField, kHeldBackReport);
+      r.fields.emplace_back(kSuppressedField, state.suppressed);
+      due.emplace_back(std::move(r), sinks->snapshot());
+    }
+    for (auto& [key, state] : registry.sites) {
+      if (state.suppressed == 0 || !state.pending) continue;
+      state.suppressed = 0;  // reported above, or its logger is gone
       state.pending.reset();
       ++state.interval;
     }

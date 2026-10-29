@@ -294,6 +294,33 @@ TEST(a_held_report_keeps_its_exclusions_through_a_relay) {
   CHECK_EQ(a_entered.load(), 1);  // and its echo did not come back to A either
 }
 
+// A sink that throws on its report line loses that line only: the other sites' lines arrive,
+// the loss is counted, and the exception reaches the caller as a log call's would.
+TEST(a_sink_that_throws_on_a_report_loses_that_line_only_and_is_counted) {
+  const auto failures_before = etch::detail::rate_report_failures().load();
+  auto fragile = std::make_shared<etch::CallbackSink>([](const etch::Record& r) {
+    for (const auto& f : r.fields) {
+      if (f.key == "report") throw std::runtime_error("no reports here");
+    }
+  });
+  etch::Logger fragile_log{"fragile", {fragile}};
+  Captured sound("sound");
+  for (int i = 0; i < 3; ++i) fragile_log.every(1h).warn("fragile {}", i);
+  for (int i = 0; i < 3; ++i) sound.log.every(1h).warn("sound {}", i);
+  bool threw = false;
+  try {
+    etch::detail::report_pending_rates();
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  CHECK(threw);
+  CHECK_EQ(etch::detail::rate_report_failures().load(), failures_before + 1);
+  CHECK_EQ(sound.sink->records().size(), 2u);  // "sound 0" and the report for the two held
+  etch::SummarySink summary;
+  CHECK(summary.json().find(std::format("\"report_failures\":{}", failures_before + 1)) !=
+        std::string::npos);
+}
+
 TEST(a_logger_that_is_gone_takes_its_pending_count_with_it) {
   auto sink = std::make_shared<etch::MemorySink>();
   {

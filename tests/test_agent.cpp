@@ -158,6 +158,57 @@ TEST(zz_child_probe_the_installed_summary_is_written_on_a_fatal) {
   CHECK(at_fatal[0].find("\"records\":2") != std::string::npos);
 }
 
+// Releases a gate when flushed: an async sink in front of it that was never written to has
+// no idle flush of its own, so the first thing to flush it is the exit handler's drain.
+struct GateOnFlush final : etch::Sink {
+  std::atomic<bool>& gate;
+  explicit GateOnFlush(std::atomic<bool>& g) : gate(g) {}
+  void write(const etch::Record&) override {}
+  void flush() override { gate = true; }
+};
+
+// Child probe: records queued before exit whose callback logs through a rate gate only once
+// the exit handler's drain has begun. The summary written at exit must count the held-back
+// report those calls leave behind, so the handler has to drain, report, and only then write.
+TEST(zz_child_probe_the_exit_summary_counts_what_the_drain_held_back) {
+  if (!in_child()) return;
+  const std::filesystem::path path = etch::detail::env("ETCH_TEST_SUMMARY_PATH");
+  CHECK(!path.empty());
+  if (path.empty()) return;
+  static std::atomic<bool> gate{false};
+  // Registered first, so the drain reaches it first; it has nothing queued, so nothing but
+  // the drain's flush ever flushes it.
+  static auto opener = std::make_shared<etch::AsyncSink>(std::make_shared<GateOnFlush>(gate));
+  static std::atomic<int> entered{0};
+  static auto parked = std::make_shared<etch::AsyncSink>(
+      std::make_shared<etch::CallbackSink>([](const etch::Record& r) {
+        entered.fetch_add(1);
+        while (!gate.load()) std::this_thread::sleep_for(1ms);
+        etch::every(1h).warn("held behind the drain {}", r.message);  // the default logger
+      }));
+  static etch::Logger log{"drain", {parked}};
+  for (int i = 0; i < 4; ++i) log.warn("{}", i);
+  for (int i = 0; i < 5000 && entered.load() < 1; ++i) std::this_thread::sleep_for(1ms);
+  CHECK_EQ(entered.load(), 1);  // parked in the first callback, three more queued
+  (void)etch::SummarySink::install(path);
+  std::exit(check::current_failures() == 0 ? 0 : 7);  // the handlers do the rest
+}
+
+TEST(the_exit_summary_counts_what_the_drain_held_back) {
+  const auto path = scratch_dir() / "drain-summary.json";
+  const std::string path_utf8 = etch::utf8(path);
+  CHECK_EQ(run_test_in_child("zz_child_probe_the_exit_summary_counts_what_the_drain_held_back",
+                             {{"ETCH_TEST_SUMMARY_PATH", path_utf8.c_str()}}),
+           0);
+  const auto lines = read_lines(path);
+  CHECK_EQ(lines.size(), 1u);
+  if (lines.empty()) return;
+  // Through the default logger: the first nested call, and the report for the three held.
+  CHECK(lines[0].find("\"written_at\":\"exit\"") != std::string::npos);
+  CHECK(lines[0].find("\"records\":2") != std::string::npos);
+  CHECK(lines[0].find("\"warn\":2") != std::string::npos);
+}
+
 // The run id in a summary object, or an empty string.
 std::string run_id_in(const std::string& json) {
   const auto key = json.find("\"run_id\":\"");

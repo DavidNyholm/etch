@@ -149,12 +149,18 @@ MUTATIONS = [
     (
         "rate_limit.hpp",
         "the shutdown report forgets to reset the count",
-        [("      state.suppressed = 0;\n      state.pending.reset();\n", "")],
+        [
+            (
+                "      state.suppressed = 0;  // reported above, or its logger is gone\n"
+                "      state.pending.reset();\n",
+                "",
+            ),
+        ],
     ),
     (
         "rate_limit.hpp",
         "the shutdown report drops the held call's own fields",
-        [("        r.fields = std::move(state.pending->fields);\n", "")],
+        [("      r.fields = state.pending->fields;\n", "")],
     ),
     (
         "agent.hpp",
@@ -179,7 +185,7 @@ MUTATIONS = [
     (
         "rate_limit.hpp",
         "a held-back report is not marked as one",
-        [("        r.fields.emplace_back(kReportField, kHeldBackReport);\n", "")],
+        [("      r.fields.emplace_back(kReportField, kHeldBackReport);\n", "")],
     ),
     (
         "async_sink.hpp",
