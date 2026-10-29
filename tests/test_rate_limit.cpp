@@ -5,6 +5,19 @@ namespace {
 
 using namespace std::chrono_literals;
 
+// Makes every rate-gated site on the given line of this file look as if its interval elapsed
+// long ago, under the registry lock: how a test moves time on without sleeping, since the
+// gate reads the steady clock directly and no scheduling delay can then fail or pass it.
+void age_sites_on_line(std::uint_least32_t line) {
+  auto& registry = etch::detail::rate_registry();
+  std::lock_guard lock(registry.mutex);
+  for (auto& [key, state] : registry.sites) {
+    if (key.line == line && key.file == std::source_location::current().file_name()) {
+      state.last = std::chrono::steady_clock::now() - std::chrono::hours{1};
+    }
+  }
+}
+
 std::optional<std::int64_t> suppressed_field(const etch::Record& r) {
   for (const auto& f : r.fields) {
     if (f.key == "suppressed") {
@@ -72,12 +85,13 @@ TEST(every_passes_one_call_per_interval_and_counts_the_rest) {
   // A long interval: within it only the first call passes, whatever the machine's speed.
   for (int i = 0; i < 10; ++i) c.log.every(1h).warn("spam {}", i);
   CHECK_EQ(c.messages(), (std::vector<std::string>{"spam 0"}));
-  // A short interval, waited out before the last call of the same site: that call passes and
-  // says how many were held back. The interval is long enough that a scheduling delay
-  // between two back-to-back calls does not elapse it (5 ms was not).
-  for (int i = 0; i < 5; ++i) {
-    if (i == 4) std::this_thread::sleep_for(350ms);
-    c.log.every(250ms).warn("burst {}", i);
+  // The same site, its interval moved past between the fourth and fifth call (no sleep, so
+  // no scheduling delay can admit a call early): the fifth passes and says how many were
+  // held back; the one held after it is a new interval's, with its own representative.
+  const auto burst_line = std::source_location::current().line() + 3;
+  for (int i = 0; i < 6; ++i) {
+    if (i == 4) age_sites_on_line(burst_line);
+    c.log.every(1h).warn("burst {}", i);
   }
   const auto records = c.sink->records();
   CHECK_EQ(records.size(), 3u);
@@ -86,6 +100,18 @@ TEST(every_passes_one_call_per_interval_and_counts_the_rest) {
   CHECK(!suppressed_field(records[1]));
   CHECK_EQ(records[2].message, std::string("burst 4"));
   CHECK(suppressed_field(records[2]) == std::optional<std::int64_t>{3});
+  // The report: the spam site's nine held calls (its line comes first), then "burst 5", held
+  // in the new interval, with the new interval's count and not the retired "burst 1".
+  etch::detail::report_pending_rates();
+  const auto reported = c.sink->records();
+  CHECK_EQ(reported.size(), 5u);
+  if (reported.size() < 5) return;
+  CHECK_EQ(reported[3].message, std::string("spam 1"));
+  CHECK(suppressed_field(reported[3]) == std::optional<std::int64_t>{9});
+  CHECK_EQ(reported[4].message, std::string("burst 5"));
+  CHECK(suppressed_field(reported[4]) == std::optional<std::int64_t>{1});
+  etch::detail::report_pending_rates();
+  CHECK_EQ(c.sink->records().size(), 5u);  // nothing left for either site
 }
 
 TEST(rate_gated_calls_below_the_level_are_not_counted) {
@@ -116,9 +142,10 @@ TEST(a_filtered_call_at_a_site_does_not_use_its_budget) {
 
 TEST(the_generated_suppressed_field_replaces_a_supplied_one) {
   Captured c;
+  const auto pass_line = std::source_location::current().line() + 3;
   for (int i = 0; i < 3; ++i) {
-    if (i == 2) std::this_thread::sleep_for(20ms);
-    c.log.every(5ms).with({{"suppressed", 99}}).warn("pass {}", i);
+    if (i == 2) age_sites_on_line(pass_line);
+    c.log.every(1h).with({{"suppressed", 99}}).warn("pass {}", i);
   }
   const auto records = c.sink->records();
   CHECK_EQ(records.size(), 2u);

@@ -722,13 +722,8 @@ class AsyncSink final : public Sink {
     sync_->drained.notify_all();   // a flush() waiting on the worker during shutdown
   }
 
-  // Shuts every live async sink down; the exit handler. The registry lock is held throughout,
-  // so no sink can be destroyed under our feet. What the rate gates still hold back is
-  // written first, while the queues are still open to take it, and once more after the
-  // drain, since the drain runs sinks that may themselves log through a gate; the sinks are
-  // synchronous by then, so that second report lands at once. What that second report's own
-  // lines hold back in turn (a sink that logs through a gate on every write) is the one
-  // count that is not reported.
+  // Shutting every live sink down (etch::shutdown(), the exit handlers) is
+  // detail::shutdown_all in async_control.hpp.
   friend void flush_all();
   friend void prepare_fork();
 

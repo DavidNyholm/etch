@@ -7,7 +7,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <cstdlib>
 #include <exception>
 #include <map>
 #include <memory>
@@ -106,26 +105,14 @@ inline std::atomic<bool>& summary_finalized() noexcept {
   return finalized;
 }
 
-inline void report_pending_rates();  // below
-
-// Made on first use, never destroyed. Its maker registers an exit handler of its own, so a
-// program with neither an async sink nor a run summary (a console-only tool) still gets its
-// held-back counts reported at exit; the handlers of those two report as well, and a report
-// finds nothing twice.
+// Made on first use, never destroyed. It registers no exit handler of its own: the first
+// rate-limited call can happen on an async worker while the process is already exiting (a
+// callback that logs only during the drain), and registering an exit handler from another
+// thread then deadlocks on the C runtime's exit lock. The default logger's exit handler
+// reports the pending counts instead (default_logger.hpp), as do etch::shutdown() and the
+// run summary's handler; a report finds nothing twice.
 inline RateRegistry& rate_registry() {
-  static RateRegistry* const registry = [] {
-    auto* made = new RateRegistry;
-    std::atexit([] {
-      if (summary_finalized().load(std::memory_order_acquire)) return;
-      try {
-        report_pending_rates();
-      } catch (...) {
-        // A sink threw on a report line: counted in rate_report_failures(); nothing may
-        // throw out of an exit handler.
-      }
-    });
-    return made;
-  }();
+  static RateRegistry* const registry = new RateRegistry;
   return *registry;
 }
 

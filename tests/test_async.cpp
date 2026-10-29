@@ -705,6 +705,33 @@ TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
   CHECK_EQ(async->waiting(), 0u);
 }
 
+// A record logged while shutdown() is draining the ring is not written at once (it would
+// overtake the ring's contents) and not lost: it waits for the worker to finish and is
+// written after them, by the thread that logged it. The worker is parked in its first write,
+// so the drain cannot end before the late record has been logged; a releaser lets it end.
+TEST(a_record_logged_during_shutdown_is_written_after_the_ring) {
+  auto held = std::make_shared<GatedRecorder>();
+  auto async = std::make_shared<etch::AsyncSink>(held, 2);  // blocking, two slots
+  etch::Logger log{"late", {async}};
+  log.warn("parks the worker");
+  for (int i = 0; i < 5000 && held->entered.load() < 1; ++i) std::this_thread::sleep_for(1ms);
+  CHECK_EQ(held->entered.load(), 1);
+  log.warn("slot one");
+  log.warn("slot two");                             // the ring is full; the worker is parked
+  std::jthread closer([&] { async->shutdown(); });  // closes the queue, then waits on the worker
+  std::this_thread::sleep_for(20ms);  // the queue is closed by now (if not, the test still holds)
+  std::jthread releaser([&] {
+    std::this_thread::sleep_for(20ms);  // the late record is being logged by now
+    held->allowed = 1 << 20;
+  });
+  log.warn("late");  // waits for the drain, then goes straight through
+  closer.join();
+  releaser.join();
+  std::lock_guard lock(held->mutex);
+  CHECK_EQ(held->messages,
+           (std::vector<std::string>{"parks the worker", "slot one", "slot two", "late"}));
+}
+
 // ---- worker priority (0.5.0) -------------------------------------------------------------
 
 // The calling thread's scheduling priority as the OS reports it: Windows thread priority (0

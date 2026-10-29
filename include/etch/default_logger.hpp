@@ -121,6 +121,16 @@ inline Logger& default_logger() {
   static Logger* const instance = [] {
     auto* logger = new Logger{"main", {std::make_shared<ConsoleSink>()}};
     std::atexit([] {
+      // What the rate gates still hold back is reported first (a console-only program has
+      // no other handler that would), unless the run summary has written its final object;
+      // then the default logger is flushed. Nothing may throw out of here.
+      if (!detail::summary_finalized().load(std::memory_order_acquire)) {
+        try {
+          detail::report_pending_rates();
+        } catch (...) {
+          // A sink threw on a report line: counted in rate_report_failures().
+        }
+      }
       detail::process_exiting().store(true, std::memory_order_relaxed);
       try {
         default_logger().flush();
