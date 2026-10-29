@@ -271,6 +271,7 @@ MUTATIONS = [
         "file_sink.hpp",
         "file sink opens in text mode (CRLF on Windows)",
         [("std::ios::out | std::ios::binary |", "std::ios::out |")],
+        {"windows"},  # text mode is binary mode on Linux: nothing to catch there
     ),
     (
         "async_sink.hpp",
@@ -424,6 +425,7 @@ MUTATIONS = [
         "file_sink.hpp",
         "a refused rotation is retried on every line",
         [(" && size_ >= retry_rotation_at_) rotate();", ") rotate();")],
+        {"windows"},  # a rotation can only be refused on Windows (a viewer holding the file)
     ),
     (
         "file_sink.hpp",
@@ -608,7 +610,12 @@ MUTATIONS = [
     (
         "file_sink.hpp",
         "the exit handler does not flush the open file sinks",
-        [("    for (const auto& sink : live) sink->flush();\n", "")],
+        [
+            (
+                "      if (sink == nullptr) break;\n      sink->flush();\n",
+                "      if (sink == nullptr) break;\n",
+            )
+        ],
         {"linux"},
     ),
     (
