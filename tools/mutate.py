@@ -761,7 +761,8 @@ def main() -> int:
     platform_name = "windows" if on_windows else "linux"
     configure_preset = "windows" if opts.preset in ("windows", "windows-release") else opts.preset
     build_dir = ROOT / "build" / configure_preset
-    build_args = ["cmake", "--build", str(build_dir), "--target", "etch_tests"]
+    # --parallel: a mutant rebuilds a handful of translation units; one core per unit.
+    build_args = ["cmake", "--build", str(build_dir), "--target", "etch_tests", "--parallel"]
     if opts.preset in ("windows", "windows-release"):
         configuration = "Release" if opts.preset == "windows-release" else "Debug"
         build_args += ["--config", configuration]
