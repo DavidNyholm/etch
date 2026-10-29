@@ -615,7 +615,8 @@ struct GatedRecorder final : etch::Sink {
 // that frees the slots, so without the rule the flood (already in its loop) takes both slots
 // while the kept producer is still waking, and the order shows it.
 TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
-  constexpr int kFlood = 2000;
+  constexpr int kFlood = 2000;        // at least this many, and until the kept record is in
+  constexpr int kFloodCap = 1 << 20;  // bounded, so a broken reservation fails, not hangs
   auto held = std::make_shared<GatedRecorder>();
   auto async = std::make_shared<etch::AsyncSink>(held, 2, etch::AsyncSink::Overflow::kDrop,
                                                  etch::Level::kError);
@@ -628,10 +629,17 @@ TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
   std::jthread kept([&] { log.error("kept"); });  // at keep_from: waits for a slot
   for (int i = 0; i < 5000 && async->waiting() < 1; ++i) std::this_thread::sleep_for(1ms);
   CHECK_EQ(async->waiting(), 1u);
-  // The worker finishes the first write, sweeps both slots (freeing them) and parks in the
-  // second write. The flood runs while the kept producer is waking up.
-  held->allowed = 1;
-  for (int i = 0; i < kFlood; ++i) log.warn("flood {}", i);
+  // Two more writes: the worker finishes the first, reports the flood's first drops as a gap
+  // marker (a write of its own) if the flood has begun, sweeps both slots (freeing them) and
+  // parks again by its third write at the latest. The flood runs while the kept producer is
+  // waking up.
+  held->allowed = 2;
+  // The ring is still full when the flood starts (the worker wakes on a millisecond sleep),
+  // so the flood must outlast the freeing sweep: it runs until the kept record is in.
+  int sent = 0;
+  for (; sent < kFlood || (async->waiting() > 0 && sent < kFloodCap); ++sent) {
+    log.warn("flood {}", sent);
+  }
   held->allowed = 1 << 20;  // let everything through
   kept.join();
   async->flush();
@@ -644,7 +652,7 @@ TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
   CHECK(kept_at < first_flood);  // also holds when no flood record was delivered at all
   const auto flood_delivered = static_cast<std::size_t>(
       std::ranges::count_if(got, [](const std::string& m) { return m.starts_with("flood "); }));
-  CHECK_EQ(flood_delivered + async->dropped(), static_cast<std::size_t>(kFlood));
+  CHECK_EQ(flood_delivered + async->dropped(), static_cast<std::size_t>(sent));
   CHECK_EQ(async->waiting(), 0u);
 }
 
