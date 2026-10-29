@@ -247,6 +247,12 @@ class SummarySink final : public Sink {
         if (s.fork_generation != detail::fork_generation().load(std::memory_order_relaxed)) {
           return;
         }
+        // What the rate gates still hold back goes to the sinks first, so the summary counts it.
+        try {
+          detail::report_pending_rates();
+        } catch (...) {
+          // Nothing may throw out of an exit handler: a sink that threw loses those lines only.
+        }
         flush_all();
         s.sink->flush_watched();
         if (const auto ec = s.sink->write_to(s.path)) {

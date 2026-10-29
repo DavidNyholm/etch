@@ -19,6 +19,7 @@
 
 #include "async_registry.hpp"
 #include "delivery.hpp"
+#include "rate_limit.hpp"
 #include "record_ring.hpp"
 #include "sinks.hpp"
 
@@ -732,8 +733,16 @@ class AsyncSink final : public Sink {
   }
 
   // Shuts every live async sink down; the exit handler. The registry lock is held throughout,
-  // so no sink can be destroyed under our feet.
+  // so no sink can be destroyed under our feet. First, what the rate gates still hold back is
+  // written, while the queues are still open to take it.
   static void shutdown_all() noexcept {
+    try {
+      detail::report_pending_rates();
+    } catch (...) {
+      // A sink threw on one of those lines (or memory ran out building them): at shutdown
+      // there is nothing left to tell; the other lines of the report were delivered or lost
+      // with it, and the shutdown goes on.
+    }
     detail::process_exiting().store(true, std::memory_order_relaxed);
     for_each_live([](AsyncSink& sink) { sink.shutdown(); });
   }

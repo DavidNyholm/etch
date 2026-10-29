@@ -26,6 +26,7 @@
 #include "context.hpp"
 #include "delivery.hpp"
 #include "level.hpp"
+#include "rate_limit.hpp"
 #include "record.hpp"
 #include "sink_set.hpp"
 #include "sinks.hpp"
@@ -153,18 +154,6 @@ inline bool same_path_prefix(std::string_view path, std::string_view prefix) noe
 
 class SinkSet;
 
-// The count of held-back calls rides on the line that gets through, as a field of this name,
-// replacing any field of that name the caller supplied.
-inline constexpr std::string_view kSuppressedField = "suppressed";
-
-// A rate gate carried by a scope timer with a threshold: decided at the end, by the scopes
-// that turned out slow (see Logger::Entry::scope).
-struct RateGate {
-  std::chrono::nanoseconds interval{0};
-  bool once = false;
-  bool gated = false;
-};
-
 }  // namespace detail
 
 class Logger;
@@ -210,54 +199,6 @@ struct LoggerOptions {
   bool stacktrace_on_fatal = true;  // append std::stacktrace to every fatal message
 };
 
-
-namespace detail {
-
-// One call site of every() or once(): when it last got through and how many calls were held
-// back since. Keyed by the call's source location (the file name is a string literal, so a
-// view of it stays valid for the life of the program). Never destroyed: a static destructor
-// may log.
-struct RateKey {
-  std::string_view file;  // compared by contents: the same header line in two translation
-                          // units can carry the same text at two addresses
-  std::uint_least32_t line = 0;
-  std::uint_least32_t column = 0;
-  auto operator<=>(const RateKey&) const = default;
-};
-struct RateState {
-  std::chrono::steady_clock::time_point last{};
-  std::uint64_t suppressed = 0;
-  bool fired = false;
-};
-struct RateRegistry {
-  std::mutex mutex;
-  std::map<RateKey, RateState> sites;
-};
-inline RateRegistry& rate_registry() {
-  static RateRegistry* const registry = new RateRegistry;
-  return *registry;
-}
-
-// Whether the call at `where` may go through: the first one always, then one per `interval`
-// (once() is an interval that never elapses). `suppressed` receives how many calls were held
-// back since the last one that went through, so the line that gets through can say so.
-inline bool admit_rate(const std::source_location& where, std::chrono::nanoseconds interval,
-                       bool once, std::uint64_t& suppressed) {
-  RateRegistry& registry = rate_registry();
-  std::lock_guard lock(registry.mutex);
-  RateState& state = registry.sites[RateKey{where.file_name(), where.line(), where.column()}];
-  const auto now = std::chrono::steady_clock::now();
-  if (state.fired && (once || now - state.last < interval)) {
-    ++state.suppressed;
-    return false;
-  }
-  state.fired = true;
-  state.last = now;
-  suppressed = std::exchange(state.suppressed, 0);
-  return true;
-}
-
-}  // namespace detail
 
 class Logger {
  public:
@@ -458,6 +399,20 @@ class Logger {
  private:
   friend class ScopeTimer;
 
+  // The shape of a rate-limited call that was held back, for the report at shutdown (see
+  // detail::report_pending_rates): the line it would have written, minus the time.
+  detail::PendingRate held_back(Level level, const std::source_location& where, std::string message,
+                                Fields fields) const {
+    return detail::PendingRate{.level = level,
+                               .logger = name_,
+                               .message = std::move(message),
+                               .fields = std::move(fields),
+                               .where = where,
+                               .thread = std::this_thread::get_id(),
+                               .thread_index = detail::this_thread_index(),
+                               .sinks = sinks_};
+  }
+
   // Stamps and delivers without the level check: for a scope timer's end line, whose level was
   // checked when the scope began.
   void deliver(Record r) {
@@ -569,7 +524,13 @@ inline ScopeTimer::~ScopeTimer() {
     if (took < options_.min_duration) return;
     if (gate_.gated) {  // a rate-gated threshold scope: the slow ones spend the budget
       std::uint64_t suppressed = 0;
-      if (!detail::admit_rate(where_, gate_.interval, gate_.once, suppressed)) return;
+      const auto admission = detail::admit_rate(where_, gate_.interval, gate_.once, suppressed);
+      if (admission == detail::Admission::kHeldFirst) {
+        detail::note_pending_rate(logger_.held_back(
+            options_.level, where_, std::format("{}: done in {}", what_, format_duration(took)),
+            std::move(fields_)));
+      }
+      if (admission != detail::Admission::kAdmitted) return;
       if (suppressed > 0) {
         std::erase_if(fields_, [](const Field& f) { return f.key == detail::kSuppressedField; });
         fields_.emplace_back(detail::kSuppressedField, suppressed);
@@ -633,18 +594,21 @@ class Logger::Entry {
   template <Level L, class... Args>
   void log_at(FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) && {
     if constexpr (L >= kCompileTimeMinLevel) {
-      if (!active_ || !logger_.enabled(L) || !admit(fmt.where)) return;
-      Record r;
-      r.level = L;
-      r.where = fmt.where;
-      r.message = std::vformat(fmt.format.get(), std::make_format_args(args...));
-      r.fields = take();
-      logger_.emit(std::move(r));
+      std::move(*this).log(L, fmt, std::forward<Args>(args)...);
     }
   }
   template <class... Args>
   void log(Level level, FormatWithLocation<std::type_identity_t<Args>...> fmt, Args&&... args) && {
-    if (!active_ || !logger_.enabled(level) || !admit(fmt.where)) return;
+    if (!active_ || !logger_.enabled(level)) return;
+    const auto admission = admit(fmt.where);
+    if (admission != detail::Admission::kAdmitted) {
+      // The first call held back since the site last got through is formatted once, so the
+      // count can be reported in its shape at shutdown; the rest cost the gate alone.
+      if (admission == detail::Admission::kHeldFirst) {
+        note_held(level, fmt.where, std::vformat(fmt.format.get(), std::make_format_args(args...)));
+      }
+      return;
+    }
     Record r;
     r.level = level;
     r.where = fmt.where;
@@ -680,7 +644,12 @@ class Logger::Entry {
   void hexdump(Level level, std::string_view label, const void* data, std::size_t size,
                std::size_t limit = kDefaultHexdumpLimit,
                std::source_location where = std::source_location::current()) && {
-    if (!active_ || !logger_.enabled(level) || !admit(where)) return;
+    if (!active_ || !logger_.enabled(level)) return;
+    const auto admission = admit(where);
+    if (admission != detail::Admission::kAdmitted) {
+      if (admission == detail::Admission::kHeldFirst) note_held(level, where, std::string(label));
+      return;
+    }
     Record r = Logger::hexdump_record(level, label, data, size, limit, where);
     r.fields = take();
     logger_.emit(std::move(r));
@@ -707,7 +676,10 @@ class Logger::Entry {
       if (options.min_duration > std::chrono::nanoseconds{0}) {
         gate = detail::RateGate{.interval = interval_, .once = once_, .gated = true};
         options.begin = false;
-      } else if (!admit(where)) {
+      } else if (const auto admission = admit(where); admission != detail::Admission::kAdmitted) {
+        if (admission == detail::Admission::kHeldFirst) {
+          note_held(options.level, where, std::string(what));
+        }
         options.level = Level::kOff;
       }
     }
@@ -724,15 +696,20 @@ class Logger::Entry {
   // The rate gate, after the level check so a filtered call costs nothing and is not counted.
   // When the call goes through after others were held back, the count rides on it as the
   // `suppressed` field, replacing any field of that name the caller supplied.
-  bool admit(const std::source_location& where) {
-    if (!rate_gated_) return true;
+  detail::Admission admit(const std::source_location& where) {
+    if (!rate_gated_) return detail::Admission::kAdmitted;
     std::uint64_t suppressed = 0;
-    if (!detail::admit_rate(where, interval_, once_, suppressed)) return false;
-    if (suppressed > 0) {
+    const auto admission = detail::admit_rate(where, interval_, once_, suppressed);
+    if (admission == detail::Admission::kAdmitted && suppressed > 0) {
       std::erase_if(owned_, [](const Field& f) { return f.key == detail::kSuppressedField; });
       owned_.emplace_back(detail::kSuppressedField, suppressed);
     }
-    return true;
+    return admission;
+  }
+  // The first held call's shape goes to the rate registry, fields included (the entry is used
+  // up either way), for the report at shutdown.
+  void note_held(Level level, const std::source_location& where, std::string message) {
+    detail::note_pending_rate(logger_.held_back(level, where, std::move(message), take()));
   }
 
   Logger& logger_;

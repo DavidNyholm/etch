@@ -21,6 +21,7 @@
 #include "json.hpp"
 #include "level.hpp"
 #include "logger.hpp"
+#include "rate_limit.hpp"
 #include "record.hpp"
 #include "record_ring.hpp"
 #include "sink_set.hpp"

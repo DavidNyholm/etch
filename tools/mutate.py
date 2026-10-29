@@ -117,12 +117,12 @@ MUTATIONS = [
         [("    root.set_level(*spec.root, /*own=*/false);\n", "")],
     ),
     (
-        "logger.hpp",
+        "rate_limit.hpp",
         "once() fires every time",
         [("  state.fired = true;\n", "")],
     ),
     (
-        "logger.hpp",
+        "rate_limit.hpp",
         "every() never refills its budget",
         [("now - state.last < interval", "now - state.last >= interval || true")],
     ),
@@ -131,12 +131,35 @@ MUTATIONS = [
         "the suppressed count is never reported",
         [
             (
-                "if (!detail::admit_rate(where, interval_, once_, suppressed)) return false;\n"
-                "    if (suppressed > 0) {",
-                "if (!detail::admit_rate(where, interval_, once_, suppressed)) return false;\n"
-                "    if (suppressed < 0) {",
+                "    if (admission == detail::Admission::kAdmitted && suppressed > 0) {",
+                "    if (admission == detail::Admission::kAdmitted && suppressed < 0) {",
             ),
         ],
+    ),
+    (
+        "rate_limit.hpp",
+        "the first held call is never noted for the shutdown report",
+        [
+            (
+                "    return state.suppressed == 1 ? Admission::kHeldFirst : Admission::kHeld;",
+                "    return Admission::kHeld;",
+            ),
+        ],
+    ),
+    (
+        "rate_limit.hpp",
+        "the shutdown report forgets to reset the count",
+        [("      state.suppressed = 0;\n      state.pending.reset();\n", "")],
+    ),
+    (
+        "rate_limit.hpp",
+        "the shutdown report drops the held call's own fields",
+        [("        r.fields = std::move(state.pending->fields);\n", "")],
+    ),
+    (
+        "async_sink.hpp",
+        "shutdown does not report the held-back counts",
+        [("      detail::report_pending_rates();\n", "")],
     ),
     (
         "logger.hpp",
