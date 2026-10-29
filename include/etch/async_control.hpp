@@ -34,46 +34,30 @@ inline void report_pending_rates_at_shutdown() noexcept {
   }
 }
 
-// `at_exit`: called from an exit handler. The held-back reports are then made once in the
-// process, by whichever handler gets here first (the run summary's, which writes its file
-// right after, or the async sinks' own): a later handler drains what is left but reports
-// nothing more, so a summary file never misses lines that were reported after it was
-// written. etch::shutdown() called by the program reports every time and leaves the
-// exit-time reports to the handlers.
+// `at_exit`: called from an exit handler. Exit handlers report the held-back counts until the
+// run summary has written its final object (its own handler sets summary_finalized after the
+// write, and always reports before it, whatever order the handlers run in); after that a
+// report would be a line the file cannot show, so none is made. etch::shutdown() called by
+// the program reports every time.
+//
+// One limit, documented rather than engineered around: a std::exit() on another thread while
+// the program's own shutdown() is still delivering a report (a sink of the report's that
+// blocks) can write the summary before that report reaches the summary sink. Serialising the
+// two would turn such a sink into a deadlock at exit instead. Call shutdown() at the end of
+// main, on the thread that exits.
 inline void shutdown_all(bool at_exit) noexcept {
-  // Exit handlers report unless the run summary has already written its final object (then
-  // a report would be one the file cannot show); the summary's own handler sets that flag
-  // after its write, so it always reports first, whatever order the handlers run in.
   const bool report = !at_exit || !summary_finalized().load(std::memory_order_acquire);
   if (report) report_pending_rates_at_shutdown();
   process_exiting().store(true, std::memory_order_seq_cst);  // pairs with the first sink's look
-  // One entry at a time, claimed under the registry lock and shut down outside it, so no
+  // One entry at a time: found under the registry lock, shut down outside it, so no
   // allocation is needed (nothing may throw here) and no sink is joined while the lock is
   // held (a callback of the sink being drained may destroy another sink, whose destructor
-  // takes the lock). A sink registered while this runs is claimed on a later turn; one
-  // claimed by an earlier shutdown_all() is already shut down. With no registry at all no
-  // sink was ever made, and the registry is not made here (that would allocate).
-  for (;;) {
-    std::shared_ptr<AsyncEntry> entry;
-    {
-      AsyncRegistry* const registry = async_registry_if_made();
-      if (registry == nullptr) break;
-      std::lock_guard lock(registry->mutex);
-      for (const auto& candidate : registry->live) {
-        if (!candidate->shutdown_requested.exchange(true, std::memory_order_acq_rel)) {
-          entry = candidate;
-          break;
-        }
-      }
-    }
-    if (entry == nullptr) break;
-    std::lock_guard entry_lock(entry->mutex);
-    if (AsyncSink* sink = entry->sink.load(std::memory_order_relaxed)) sink->shutdown();
-    entry->shutdown_done.store(true, std::memory_order_release);
-  }
-  // A claim is not a drain: an entry another thread claimed (the program's own shutdown()
-  // racing an exit) may still be draining. Its entry lock is held for as long as that
-  // takes, so taking it here is waiting for the drain, one entry at a time as above.
+  // takes the lock). The entry's own lock is held across its shutdown, so two threads here
+  // at once (the program's shutdown() racing an exit) take turns on each entry, and the
+  // second finds it done rather than skipping a drain the first has only begun: a sink is
+  // marked done by the thread that shut it down, under that lock, never by a look. A sink
+  // registered while this runs is found on a later turn. With no registry at all no sink
+  // was ever made, and the registry is not made here (that would allocate).
   for (;;) {
     std::shared_ptr<AsyncEntry> entry;
     {
@@ -88,8 +72,11 @@ inline void shutdown_all(bool at_exit) noexcept {
       }
     }
     if (entry == nullptr) break;
-    std::lock_guard entry_lock(entry->mutex);  // the claimer holds it until its drain is done
-    entry->shutdown_done.store(true, std::memory_order_release);
+    std::lock_guard entry_lock(entry->mutex);
+    if (!entry->shutdown_done.load(std::memory_order_acquire)) {
+      if (AsyncSink* sink = entry->sink.load(std::memory_order_relaxed)) sink->shutdown();
+      entry->shutdown_done.store(true, std::memory_order_release);
+    }
   }
   if (report) report_pending_rates_at_shutdown();
 }

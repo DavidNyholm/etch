@@ -73,10 +73,11 @@ TEST(every_passes_one_call_per_interval_and_counts_the_rest) {
   for (int i = 0; i < 10; ++i) c.log.every(1h).warn("spam {}", i);
   CHECK_EQ(c.messages(), (std::vector<std::string>{"spam 0"}));
   // A short interval, waited out before the last call of the same site: that call passes and
-  // says how many were held back.
+  // says how many were held back. The interval is long enough that a scheduling delay
+  // between two back-to-back calls does not elapse it (5 ms was not).
   for (int i = 0; i < 5; ++i) {
-    if (i == 4) std::this_thread::sleep_for(20ms);
-    c.log.every(5ms).warn("burst {}", i);
+    if (i == 4) std::this_thread::sleep_for(350ms);
+    c.log.every(250ms).warn("burst {}", i);
   }
   const auto records = c.sink->records();
   CHECK_EQ(records.size(), 3u);
