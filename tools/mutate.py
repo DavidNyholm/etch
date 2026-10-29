@@ -189,6 +189,26 @@ MUTATIONS = [
     ),
     (
         "async_control.hpp",
+        "exit handlers report held-back counts after the summary file is written",
+        [
+            (
+                "  const bool report = !at_exit || !summary_finalized().load(std::memory_order_acquire);",
+                "  const bool report = true;",
+            ),
+        ],
+    ),
+    (
+        "rate_limit.hpp",
+        "a program with no async sink and no summary reports nothing at exit",
+        [
+            (
+                "        report_pending_rates();\n      } catch (...) {\n        // A sink threw on a report line: counted in rate_report_failures(); nothing may\n",
+                "      } catch (...) {\n        // A sink threw on a report line: counted in rate_report_failures(); nothing may\n",
+            )
+        ],
+    ),
+    (
+        "async_control.hpp",
         "shutdown does not report the held-back counts",
         [("    report_pending_rates();\n", "")],
     ),

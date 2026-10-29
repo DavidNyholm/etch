@@ -25,11 +25,6 @@ inline void flush_all() {
 
 namespace detail {
 
-// Set by the run summary's exit handler once its final object is written (agent.hpp).
-inline std::atomic<bool>& summary_finalized() noexcept {
-  static std::atomic<bool> finalized{false};
-  return finalized;
-}
 inline void report_pending_rates_at_shutdown() noexcept {
   try {
     report_pending_rates();
@@ -74,6 +69,27 @@ inline void shutdown_all(bool at_exit) noexcept {
     if (entry == nullptr) break;
     std::lock_guard entry_lock(entry->mutex);
     if (AsyncSink* sink = entry->sink.load(std::memory_order_relaxed)) sink->shutdown();
+    entry->shutdown_done.store(true, std::memory_order_release);
+  }
+  // A claim is not a drain: an entry another thread claimed (the program's own shutdown()
+  // racing an exit) may still be draining. Its entry lock is held for as long as that
+  // takes, so taking it here is waiting for the drain, one entry at a time as above.
+  for (;;) {
+    std::shared_ptr<AsyncEntry> entry;
+    {
+      AsyncRegistry* const registry = async_registry_if_made();
+      if (registry == nullptr) break;
+      std::lock_guard lock(registry->mutex);
+      for (const auto& candidate : registry->live) {
+        if (!candidate->shutdown_done.load(std::memory_order_acquire)) {
+          entry = candidate;
+          break;
+        }
+      }
+    }
+    if (entry == nullptr) break;
+    std::lock_guard entry_lock(entry->mutex);  // the claimer holds it until its drain is done
+    entry->shutdown_done.store(true, std::memory_order_release);
   }
   if (report) report_pending_rates_at_shutdown();
 }

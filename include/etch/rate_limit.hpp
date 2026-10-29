@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <map>
 #include <memory>
@@ -98,8 +99,33 @@ struct RateRegistry {
   std::mutex mutex;
   std::map<RateKey, RateState> sites;
 };
+// Set by the run summary's exit handler once its final object is written (agent.hpp): from
+// then on no exit handler reports a held-back count, since the file could not show it.
+inline std::atomic<bool>& summary_finalized() noexcept {
+  static std::atomic<bool> finalized{false};
+  return finalized;
+}
+
+inline void report_pending_rates();  // below
+
+// Made on first use, never destroyed. Its maker registers an exit handler of its own, so a
+// program with neither an async sink nor a run summary (a console-only tool) still gets its
+// held-back counts reported at exit; the handlers of those two report as well, and a report
+// finds nothing twice.
 inline RateRegistry& rate_registry() {
-  static RateRegistry* const registry = new RateRegistry;
+  static RateRegistry* const registry = [] {
+    auto* made = new RateRegistry;
+    std::atexit([] {
+      if (summary_finalized().load(std::memory_order_acquire)) return;
+      try {
+        report_pending_rates();
+      } catch (...) {
+        // A sink threw on a report line: counted in rate_report_failures(); nothing may
+        // throw out of an exit handler.
+      }
+    });
+    return made;
+  }();
   return *registry;
 }
 

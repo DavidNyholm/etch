@@ -36,6 +36,7 @@ struct AsyncEntry {
   std::mutex mutex;
   std::atomic<AsyncSink*> sink{nullptr};  // null once the sink is gone
   std::atomic<bool> shutdown_requested{false};  // claimed by shutdown_all(), one entry at a time
+  std::atomic<bool> shutdown_done{false};       // ... and finished: another shutdown_all() waits
 };
 struct AsyncRegistry {
   std::mutex mutex;

@@ -244,6 +244,94 @@ TEST(the_exit_summary_reports_what_later_handlers_held_back) {
   CHECK(lines[0].find("\"warn\":2") != std::string::npos);
 }
 
+// Child probe: the async sink made first (its handler runs last), the summary installed
+// after it (its handler runs first). The async sink's callback, run by the summary handler's
+// drain, logs through site S into a relay logger whose sink logs through site T into the
+// default logger; reporting S makes the relay run again and leaves a fresh held call at T.
+// Nothing may report that one after the summary file is written: an independent record of
+// everything the default logger emitted must agree with the file's count.
+TEST(zz_child_probe_nothing_is_reported_after_the_summary_file_is_written) {
+  if (!in_child()) return;
+  const std::filesystem::path path = etch::detail::env("ETCH_TEST_SUMMARY_PATH");
+  CHECK(!path.empty());
+  if (path.empty()) return;
+  static std::filesystem::path records_path = path.string() + ".records";
+  static auto tally = std::make_shared<etch::CallbackSink>([](const etch::Record& r) {
+    std::ofstream out(records_path, std::ios::app);
+    out << r.message << '\n';
+  });
+  etch::default_logger().add_sink(tally);
+  static auto relay = std::make_shared<etch::CallbackSink>([](const etch::Record&) {
+    for (int i = 0; i < 2; ++i) etch::every(1h).warn("t {}", i);  // site T: default logger
+  });
+  static etch::Logger relay_log{"relay", {relay}};
+  static auto drained = std::make_shared<etch::CallbackSink>([](const etch::Record&) {
+    while (!etch::detail::process_exiting().load()) std::this_thread::sleep_for(1ms);
+    for (int i = 0; i < 2; ++i) relay_log.every(1h).warn("s {}", i);  // site S
+  });
+  static auto async = std::make_shared<etch::AsyncSink>(drained);
+  static etch::Logger log{"order", {async}};
+  log.warn("queued before exit");
+  for (int i = 0; i < 5000 && async->queued() > 0; ++i) std::this_thread::sleep_for(1ms);
+  (void)etch::SummarySink::install(path);
+  std::exit(check::current_failures() == 0 ? 0 : 7);
+}
+
+TEST(nothing_is_reported_after_the_summary_file_is_written) {
+  const auto path = scratch_dir() / "relay-summary.json";
+  const std::string path_utf8 = etch::utf8(path);
+  CHECK_EQ(run_test_in_child("zz_child_probe_nothing_is_reported_after_the_summary_file_is_written",
+                             {{"ETCH_TEST_SUMMARY_PATH", path_utf8.c_str()}}),
+           0);
+  const auto lines = read_lines(path);
+  const auto emitted = read_lines(path.string() + ".records");
+  CHECK_EQ(lines.size(), 1u);
+  if (lines.empty()) return;
+  const auto key = lines[0].find("\"records\":");
+  CHECK(key != std::string::npos);
+  if (key == std::string::npos) return;
+  const auto counted = std::stoul(lines[0].substr(key + 10));
+  CHECK_EQ(emitted.size(), counted);  // the file shows everything that was ever emitted
+  // t 0 admitted, then T's report; the relay's calls while S's report ran were held (T's
+  // interval had not elapsed) and are the one count that nothing may report any more.
+  CHECK(counted >= 2);
+}
+
+// Child probe: neither an async sink nor a run summary, as in a console-only tool; the rate
+// gate's own exit handler still reports the held-back count, to the sinks the logger has.
+TEST(zz_child_probe_a_console_only_program_reports_held_back_counts_at_exit) {
+  if (!in_child()) return;
+  const std::filesystem::path path = etch::detail::env("ETCH_TEST_SUMMARY_PATH");
+  CHECK(!path.empty());
+  if (path.empty()) return;
+  static std::filesystem::path records_path = path;
+  static auto tally = std::make_shared<etch::CallbackSink>([](const etch::Record& r) {
+    std::ofstream out(records_path, std::ios::app);
+    out << r.message;
+    for (const auto& f : r.fields) {
+      if (f.key == "suppressed") out << " suppressed=" << std::get<std::int64_t>(f.value);
+    }
+    out << '\n';
+  });
+  etch::default_logger().add_sink(tally);
+  for (int i = 0; i < 3; ++i) etch::once().warn("quiet site {}", i);
+  std::exit(check::current_failures() == 0 ? 0 : 7);
+}
+
+TEST(a_console_only_program_reports_held_back_counts_at_exit) {
+  const auto path = scratch_dir() / "console-only.records";
+  const std::string path_utf8 = etch::utf8(path);
+  CHECK_EQ(
+      run_test_in_child("zz_child_probe_a_console_only_program_reports_held_back_counts_at_exit",
+                        {{"ETCH_TEST_SUMMARY_PATH", path_utf8.c_str()}}),
+      0);
+  const auto emitted = read_lines(path);
+  CHECK_EQ(emitted.size(), 2u);
+  if (emitted.size() < 2) return;
+  CHECK_EQ(emitted[0], std::string("quiet site 0"));
+  CHECK_EQ(emitted[1], std::string("quiet site 1 suppressed=2"));
+}
+
 // The run id in a summary object, or an empty string.
 std::string run_id_in(const std::string& json) {
   const auto key = json.find("\"run_id\":\"");
