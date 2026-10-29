@@ -478,6 +478,17 @@ MUTATIONS = [
     ),
     (
         "async_sink.hpp",
+        "the worker never asks for the priority it was given",
+        [
+            (
+                "      priority_raised_.store(detail::raise_this_thread_priority(), std::memory_order_release);",
+                "      priority_raised_.store(true, std::memory_order_release);",
+            ),
+        ],
+        {"windows"},
+    ),
+    (
+        "async_sink.hpp",
         "the worker does not bracket its sweeps",
         [
             ("      bracket_inner([&] { inner_->begin_batch(); });\n", ""),

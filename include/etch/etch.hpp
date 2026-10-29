@@ -10,6 +10,7 @@
 #pragma once
 
 #include "agent.hpp"
+#include "async_control.hpp"
 #include "async_registry.hpp"
 #include "async_sink.hpp"
 #include "context.hpp"

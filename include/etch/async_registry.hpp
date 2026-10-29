@@ -11,6 +11,11 @@
 
 #if !defined(_WIN32)
 #include <pthread.h>  // pthread_atfork; on Linux also pthread_setname_np (a GNU extension)
+#if defined(__linux__)
+#include <unistd.h>  // gettid
+
+#include <sys/resource.h>  // setpriority: the worker's nice value
+#endif
 #endif
 
 namespace etch {
@@ -84,9 +89,33 @@ inline std::atomic<std::uint64_t>& worker_activity() noexcept {
 extern "C" {
 __declspec(dllimport) void* __stdcall GetCurrentThread();
 __declspec(dllimport) long __stdcall SetThreadDescription(void*, const wchar_t*);
+__declspec(dllimport) int __stdcall SetThreadPriority(void*, int);
 }
 #endif
+// THREAD_PRIORITY_ABOVE_NORMAL: one step above the process's normal priority class, where
+// the worker still yields to anything time-critical but no longer waits behind the threads
+// that fill its ring.
+inline constexpr int kThreadPriorityAboveNormal = 1;
 #endif
+// Raises the calling thread one step above its siblings: an async worker is one thread
+// among all the ones logging into it, and under CPU load a fair share is not enough for it
+// to keep up (the server testbed lost 97% of an agent log that way). Windows allows it to any
+// process. Linux needs CAP_SYS_NICE or an RLIMIT_NICE above the default to lower a nice value,
+// so there it is tried and usually refused; the caller learns which from the result. Other
+// systems: not attempted.
+inline bool raise_this_thread_priority() noexcept {
+#if defined(_WIN32)
+  return SetThreadPriority(GetCurrentThread(), kThreadPriorityAboveNormal) != 0;
+#elif defined(__linux__)
+  // PRIO_PROCESS with a thread id names one thread on Linux. -5 is modest: enough to win
+  // against normal threads, far from the real-time range.
+  constexpr int kWorkerNice = -5;
+  return setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), kWorkerNice) == 0;
+#else
+  return false;
+#endif
+}
+
 // Names the calling thread for debuggers and profilers. Best effort: the result is ignored.
 inline void name_this_thread(const char* ascii_name) noexcept {
 #if defined(_WIN32)

@@ -1,6 +1,17 @@
 // etch tests: the async sink (ordering, policies, flush barrier, failure handling).
 #include "support.hpp"
 
+#if defined(_WIN32) && !defined(_WINDOWS_)
+extern "C" {
+__declspec(dllimport) void* __stdcall GetCurrentThread();
+__declspec(dllimport) int __stdcall GetThreadPriority(void*);  // int WINAPI (HANDLE)
+}
+#elif defined(__linux__)
+#include <unistd.h>
+
+#include <sys/resource.h>
+#endif
+
 namespace {
 
 using namespace std::chrono_literals;
@@ -625,6 +636,58 @@ TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
   CHECK(kept_at != got.end());
   CHECK(kept_at < first_flood);  // also holds when no flood record was delivered at all
   CHECK_EQ(async->waiting(), 0u);
+}
+
+// ---- worker priority (0.5.0) -------------------------------------------------------------
+
+// The calling thread's scheduling priority as the OS reports it: Windows thread priority (0
+// normal, 1 above normal), Linux nice value (0 normal, negative is higher priority).
+int this_thread_priority() {
+#if defined(_WIN32)
+  return GetThreadPriority(GetCurrentThread());
+#elif defined(__linux__)
+  return getpriority(PRIO_PROCESS, static_cast<id_t>(gettid()));
+#else
+  return 0;
+#endif
+}
+
+bool is_above(int priority, int normal) {
+#if defined(__linux__)
+  return priority < normal;  // a lower nice value is a higher priority
+#else
+  return priority > normal;
+#endif
+}
+
+// The worker says truthfully whether it runs above normal: on Windows it always can; on
+// Linux only with CAP_SYS_NICE, and then the sink says it was refused rather than pretend.
+TEST(the_worker_runs_above_normal_priority_when_the_system_allows_it) {
+  constexpr int kUnset = 1000;
+  const int normal = this_thread_priority();
+  std::atomic<int> on_worker{kUnset};
+  auto probe = std::make_shared<etch::CallbackSink>(
+      [&](const etch::Record&) { on_worker = this_thread_priority(); });
+  auto async = std::make_shared<etch::AsyncSink>(probe);  // default: kAboveNormal
+  etch::Logger log{"prio", {async}};
+  log.warn("on the worker");
+  async->flush();
+  CHECK(on_worker.load() != kUnset);
+  CHECK_EQ(is_above(on_worker.load(), normal), async->worker_priority_raised());
+#if defined(_WIN32)
+  CHECK(async->worker_priority_raised());
+#endif
+  std::atomic<int> on_plain_worker{kUnset};
+  auto plain_probe = std::make_shared<etch::CallbackSink>(
+      [&](const etch::Record&) { on_plain_worker = this_thread_priority(); });
+  auto plain = std::make_shared<etch::AsyncSink>(
+      plain_probe, etch::AsyncSink::kDefaultCapacity, etch::AsyncSink::Overflow::kBlock,
+      etch::Level::kWarn, etch::AsyncSink::WorkerPriority::kInherit);
+  etch::Logger plain_log{"prio-plain", {plain}};
+  plain_log.warn("on the plain worker");
+  plain->flush();
+  CHECK(!plain->worker_priority_raised());
+  CHECK_EQ(on_plain_worker.load(), normal);
 }
 
 }  // namespace

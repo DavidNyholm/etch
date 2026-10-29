@@ -1,5 +1,5 @@
-// etch - AsyncSink: a lock-free bounded queue and a worker thread in front of any other sink,
-// plus the process-wide flush_all() and shutdown() that drain every live async sink.
+// etch - AsyncSink: a lock-free bounded queue and a worker thread in front of any other sink.
+// The process-wide flush_all(), shutdown() and prepare_fork() are in async_control.hpp.
 #pragma once
 
 #include <algorithm>
@@ -52,7 +52,9 @@ namespace etch {
 // thrown away. While such a record waits for room, droppable records are dropped at once
 // rather than queued, so the slots the worker frees go to the waiting record and not to the
 // flood that filled the ring; the wait is then one sweep of the worker at most, however many
-// threads keep flooding. Whenever records were dropped, the worker writes one warning from logger
+// threads keep flooding. A droppable record that finds the ring full yields once and looks
+// again before it is dropped, so a worker short of CPU gets some from the threads filling its
+// ring. Whenever records were dropped, the worker writes one warning from logger
 // "etch" saying how many, before the next real record, when it goes idle, and at shutdown, so the
 // file shows where its gaps are and flush() never returns with a gap unreported.
 //
@@ -84,9 +86,17 @@ namespace etch {
 // at the instant of the fork is copied held, so call etch::prepare_fork() right before the
 // fork with no other thread using etch: it returns once every worker is asleep holding
 // nothing. A sink made after the fork is an ordinary sink with a worker of its own.
+//
+// The worker runs one step above normal priority by default (WorkerPriority::kAboveNormal):
+// it is one thread among every thread that logs into it, and under CPU load a fair share is
+// not enough for it to keep up, with kDrop losing most of the log and kBlock stalling the
+// callers. Windows grants the raise to any process; Linux refuses it without CAP_SYS_NICE (or
+// a raised RLIMIT_NICE), and the sink then runs at normal priority and says so in
+// worker_priority_raised(). kInherit leaves the worker as any new thread.
 class AsyncSink final : public Sink {
  public:
   enum class Overflow { kBlock, kDrop };
+  enum class WorkerPriority { kInherit, kAboveNormal };
   // Slots are allocated up front (a Record plus a sequence number, about 200 bytes on MSVC x64,
   // so the default ring is under a megabyte); hence a modest default.
   static constexpr std::size_t kDefaultCapacity = 4096;
@@ -101,11 +111,13 @@ class AsyncSink final : public Sink {
   static constexpr int kYieldsBeforeSleep = 64;
 
   explicit AsyncSink(std::shared_ptr<Sink> inner, std::size_t capacity = kDefaultCapacity,
-                     Overflow policy = Overflow::kBlock, Level keep_from = Level::kWarn)
+                     Overflow policy = Overflow::kBlock, Level keep_from = Level::kWarn,
+                     WorkerPriority priority = WorkerPriority::kAboveNormal)
       : inner_(require_inner(std::move(inner))),
         ring_(capacity),
         policy_(policy),
         keep_from_(keep_from),
+        priority_(priority),
         counters_(std::make_shared<detail::SinkCounters>()),
         sync_(std::make_unique<Sync>()),
         generation_(detail::fork_generation().load(std::memory_order_relaxed)) {
@@ -279,6 +291,12 @@ class AsyncSink final : public Sink {
   // Producers blocked on a full ring right now (kBlock, or a record at or above keep_from).
   std::size_t waiting() const noexcept {
     return producers_waiting_.load(std::memory_order_relaxed);
+  }
+  // Whether the worker got the priority it asked for (see WorkerPriority). Known once the
+  // worker has started, which any flush() waits for; false with kInherit, after a fork, and
+  // on a system that refused the raise.
+  bool worker_priority_raised() const noexcept {
+    return priority_raised_.load(std::memory_order_acquire);
   }
   std::size_t capacity() const noexcept {
     return ring_.capacity();
@@ -457,6 +475,13 @@ class AsyncSink final : public Sink {
       return;
     }
     bool queued = !drop_now(r) && try_enqueue(r);
+    if (!queued && policy_ == Overflow::kDrop && r.level < keep_from_ && !drop_now(r)) {
+      // Full, and nothing kept is waiting for the slots: give the worker a turn, then look
+      // once more. One yield, so the caller is never stalled, only slowed by a scheduler tick
+      // while the ring is full.
+      std::this_thread::yield();
+      queued = try_enqueue(r);
+    }
     if (!queued) {
       if (policy_ == Overflow::kDrop && r.level < keep_from_) {
         note_dropped(r);
@@ -620,6 +645,9 @@ class AsyncSink final : public Sink {
 
   void run(std::stop_token st) {
     detail::name_this_thread("etch-async");
+    if (priority_ == WorkerPriority::kAboveNormal) {
+      priority_raised_.store(detail::raise_this_thread_priority(), std::memory_order_release);
+    }
     detail::on_async_worker() = true;
     const std::size_t batch_limit = (std::min)(capacity(), kMaxBatch);
     std::vector<Record> batch;
@@ -718,10 +746,12 @@ class AsyncSink final : public Sink {
   detail::RecordRing ring_;
   Overflow policy_;
   Level keep_from_;
+  WorkerPriority priority_;
   std::shared_ptr<detail::SinkCounters> counters_;  // dropped, write failures
   std::unique_ptr<Sync> sync_;
   unsigned generation_;  // the fork generation this sink was made in
   alignas(detail::kCacheLine) std::atomic<bool> worker_sleeping_{false};
+  std::atomic<bool> priority_raised_{false};   // set by the worker as it starts
   std::atomic<bool> closed_{false};            // shutdown began: new records wait, then go through
   std::atomic<bool> worker_gone_{false};       // the worker has left its loop
   std::atomic<bool> worker_finished_{false};   // ... and its final drain and flush are done
@@ -741,38 +771,5 @@ class AsyncSink final : public Sink {
 #if defined(_MSC_VER)
 #pragma warning(pop)
 #endif
-
-// Waits until every live async sink has written everything queued so far, then flushes their
-// inner sinks. Call it before anything that must see the complete log (an exception handler
-// in normal context, a test's assertion, a hand-off to another process). Not from inside a
-// sink, and not from a signal handler: it locks, allocates and waits.
-inline void flush_all() {
-  AsyncSink::for_each_live([](AsyncSink& sink) { sink.flush(); });
-}
-
-// Drains and stops every async worker and marks the process as exiting, after which every
-// async sink writes straight through and file sinks flush every line. Call it once at the end
-// of main; it also runs automatically from an exit handler. Not from inside a sink.
-inline void shutdown() { AsyncSink::shutdown_all(); }
-
-// For a program that forks after setting up its logging: waits until every async worker has
-// written everything, flushed its sink and gone to sleep, so that the fork copies no lock of
-// etch's in a held state (a worker's idle flush can hold the file sink's mutex a moment after
-// flush_all() returns). Call it right before fork(), with no other thread logging; the child
-// then logs through the inherited sinks synchronously (see AsyncSink).
-inline void prepare_fork() {
-  detail::install_fork_handler();  // so the child knows itself even with no sink made yet
-  // One sink going idle can wake another (an async sink behind an async sink gets the
-  // forwarded records, then does its own idle flush), so one sink's idleness says nothing
-  // about the others' a moment later. A pass counts only when every sink was already idle
-  // and no worker did anything at all while the pass ran; with no producer logging, the
-  // chain settles and such a pass comes.
-  for (;;) {
-    const std::uint64_t before = detail::worker_activity().load(std::memory_order_seq_cst);
-    bool waited = false;
-    AsyncSink::for_each_live([&](AsyncSink& sink) { waited = sink.wait_until_idle() || waited; });
-    if (!waited && detail::worker_activity().load(std::memory_order_seq_cst) == before) return;
-  }
-}
 
 }  // namespace etch

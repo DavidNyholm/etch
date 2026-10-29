@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "async_control.hpp"
 #include "async_sink.hpp"
 #include "default_logger.hpp"
 #include "file_sink.hpp"
@@ -55,6 +56,7 @@ struct AgentProfile {
   AsyncSink::Overflow overflow = AsyncSink::Overflow::kDrop;
   Level keep_from = Level::kWarn;
   std::size_t queue_capacity = AsyncSink::kDefaultCapacity;
+  AsyncSink::WorkerPriority worker_priority = AsyncSink::WorkerPriority::kAboveNormal;
   // Kept so that 0.4 code setting them still compiles; nothing in etch has ever read them
   // (not marked deprecated: GCC would then warn on every copy of a profile). They are advice:
   // pass the limit to hexdump() and the options to scope() yourself.
@@ -74,7 +76,7 @@ inline AgentProfile agent_profile() { return AgentProfile{}; }
   auto file = FileSink::open(path, std::move(options));
   if (!file) return std::unexpected(file.error());
   return std::make_shared<AsyncSink>(std::move(*file), profile.queue_capacity, profile.overflow,
-                                     profile.keep_from);
+                                     profile.keep_from, profile.worker_priority);
 }
 
 // Counts what passed through it and remembers the first and last error, so that at the end of
