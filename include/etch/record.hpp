@@ -204,6 +204,12 @@ namespace detail {
 // so a static object logging from its destructor still gets its lines on disk. A function-local
 // constant-initialised atomic has nothing to destroy, so it is safe to read at any point of
 // process teardown.
+// A field of this name marks a record as etch's own and says which: "run-started" on the
+// record that opens a run in an agent file, "held-back" on a line written at shutdown for a
+// rate-limited site's pending count. Reserved: a caller's field of this name on such a
+// record is replaced, and a reader tells etch's records from the application's by it.
+inline constexpr std::string_view kEtchField = "etch";
+
 inline std::atomic<bool>& process_exiting() noexcept {
   static std::atomic<bool> flag{false};
   return flag;

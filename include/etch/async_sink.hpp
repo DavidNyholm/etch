@@ -726,18 +726,26 @@ class AsyncSink final : public Sink {
   static void shutdown_all() noexcept {
     report_pending_rates_at_shutdown();
     detail::process_exiting().store(true, std::memory_order_relaxed);
-    try {
-      for_each_live([](AsyncSink& sink) { sink.shutdown(); });
-    } catch (...) {
-      // No memory for the snapshot of the live list: the sinks are shut down under the
-      // registry lock instead, which allocates nothing. A sink made by a callback during
-      // that drain would wait for the lock; at exit, with no memory, that is the lesser risk.
-      auto& registry = detail::async_registry();
-      std::lock_guard lock(registry.mutex);
-      for (const auto& entry : registry.live) {
-        std::lock_guard entry_lock(entry->mutex);
-        if (AsyncSink* sink = entry->sink.load(std::memory_order_relaxed)) sink->shutdown();
+    // One entry at a time, claimed under the registry lock and shut down outside it, so no
+    // allocation is needed (nothing may throw here) and no sink is joined while the lock is
+    // held (a callback of the sink being drained may destroy another sink, whose destructor
+    // takes the lock). A sink registered while this runs is claimed on a later turn; one
+    // claimed by an earlier shutdown_all() is already shut down.
+    for (;;) {
+      std::shared_ptr<detail::AsyncEntry> entry;
+      {
+        auto& registry = detail::async_registry();
+        std::lock_guard lock(registry.mutex);
+        for (const auto& candidate : registry.live) {
+          if (!candidate->shutdown_requested.exchange(true, std::memory_order_acq_rel)) {
+            entry = candidate;
+            break;
+          }
+        }
       }
+      if (entry == nullptr) break;
+      std::lock_guard entry_lock(entry->mutex);
+      if (AsyncSink* sink = entry->sink.load(std::memory_order_relaxed)) sink->shutdown();
     }
     report_pending_rates_at_shutdown();
   }

@@ -94,7 +94,8 @@ TEST(open_agent_log_writes_compact_json_lines) {
     CHECK(lines[0].find("\"msg\":\"run started\"") != std::string::npos);
     CHECK(lines[0].find(std::format("\"run_id\":\"{}\"", etch::run_id())) != std::string::npos);
     CHECK(lines[0].find("\"pid\":") != std::string::npos);  // on the header line only
-    CHECK(lines[0].find(std::format("\"etch\":\"{}\"", etch::kVersion)) != std::string::npos);
+    CHECK(lines[0].find("\"etch\":\"run-started\"") != std::string::npos);  // the reserved marker
+    CHECK(lines[0].find(std::format("\"version\":\"{}\"", etch::kVersion)) != std::string::npos);
     CHECK(lines[1].find("\"pid\"") == std::string::npos);
     CHECK(lines[2].find(R"("fields":{"fps":60})") != std::string::npos);
   }

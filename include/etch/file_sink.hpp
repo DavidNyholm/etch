@@ -69,6 +69,7 @@ namespace detail {
 struct OpenFile {
   FileSink* owner = nullptr;
   std::weak_ptr<FileSink> sink;
+  bool flushed_at_exit = false;  // claimed by the exit handler, one entry at a time
 };
 struct OpenFiles {
   std::mutex mutex;
@@ -345,15 +346,24 @@ class FileSink final : public Sink {
   // destroyed at the same time is skipped rather than raced.
   static void flush_open_files() noexcept {
     detail::process_exiting().store(true, std::memory_order_relaxed);
-    std::vector<std::shared_ptr<FileSink>> live;
-    {
-      detail::OpenFiles& files = detail::open_files();
-      std::lock_guard lock(files.mutex);
-      for (const auto& [key, entry] : files.by_path) {
-        if (auto sink = entry.sink.lock()) live.push_back(std::move(sink));
+    // One sink at a time, claimed under the registry lock and flushed outside it: nothing
+    // may throw here, so nothing allocates, and a sink's own mutex is never taken under the
+    // registry lock (its destructor takes them the other way round).
+    for (;;) {
+      std::shared_ptr<FileSink> sink;
+      {
+        detail::OpenFiles& files = detail::open_files();
+        std::lock_guard lock(files.mutex);
+        for (auto& [key, entry] : files.by_path) {
+          if (entry.flushed_at_exit) continue;
+          entry.flushed_at_exit = true;
+          sink = entry.sink.lock();
+          if (sink != nullptr) break;
+        }
       }
+      if (sink == nullptr) break;
+      sink->flush();
     }
-    for (const auto& sink : live) sink->flush();
   }
 
   // Takes the lock file, <name>.lock, once for the sink's life. EBUSY when another process

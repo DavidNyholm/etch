@@ -100,8 +100,9 @@ inline std::string_view run_id() noexcept {
   return std::string_view(id.data(), id.size());
 }
 
-// The record that starts a run in an agent file: "run started" from logger "etch", with the
-// run id, the pid (the profile leaves it off every other line) and the etch version.
+// The record that starts a run in an agent file: "run started" from logger "etch", marked
+// etch=run-started (the reserved field, see record.hpp), with the run id, the pid (the
+// profile leaves it off every other line) and the etch version.
 inline Record run_started_record(std::source_location where = std::source_location::current()) {
   Record r;
   r.level = Level::kInfo;
@@ -111,9 +112,10 @@ inline Record run_started_record(std::source_location where = std::source_locati
   r.where = where;
   r.logger_name = "etch";
   r.message = "run started";
+  r.fields.emplace_back(detail::kEtchField, "run-started");  // the reserved marker first
   r.fields.emplace_back("run_id", run_id());
   r.fields.emplace_back("pid", detail::process_id());
-  r.fields.emplace_back("etch", kVersion);
+  r.fields.emplace_back("version", kVersion);
   return r;
 }
 

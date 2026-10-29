@@ -202,7 +202,7 @@ TEST(held_back_counts_are_reported_in_the_first_held_calls_shape) {
   CHECK(held.level == etch::Level::kWarn);
   CHECK_EQ(held.logger_name, std::string("pending"));
   CHECK(suppressed_field(held) == std::optional<std::int64_t>{4});
-  CHECK(string_field(held, "report") == std::optional<std::string>{"held-back"});  // not a call
+  CHECK(string_field(held, "etch") == std::optional<std::string>{"held-back"});  // not a call
   CHECK(int_field(held, "frame") == std::optional<std::int64_t>{1});  // the held call's own
   CHECK(std::string_view(held.where.file_name()).ends_with("test_rate_limit.cpp"));
   etch::detail::report_pending_rates();  // reported once: the count started again at zero
@@ -300,7 +300,7 @@ TEST(a_sink_that_throws_on_a_report_loses_that_line_only_and_is_counted) {
   const auto failures_before = etch::detail::rate_report_failures().load();
   auto fragile = std::make_shared<etch::CallbackSink>([](const etch::Record& r) {
     for (const auto& f : r.fields) {
-      if (f.key == "report") throw std::runtime_error("no reports here");
+      if (f.key == "etch") throw std::runtime_error("no reports here");
     }
   });
   etch::Logger fragile_log{"fragile", {fragile}};

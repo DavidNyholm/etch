@@ -30,9 +30,9 @@ namespace etch::detail {
 // The count of held-back calls rides on the line that gets through, as a field of this name,
 // replacing any field of that name the caller supplied.
 inline constexpr std::string_view kSuppressedField = "suppressed";
-// A line written at shutdown for a count still held back carries this field with this value,
-// so a reader can tell it from a call that got through (both carry `suppressed`).
-inline constexpr std::string_view kReportField = "report";
+// A line written at shutdown for a count still held back carries the reserved `etch` field
+// (record.hpp) with this value, so a reader can tell it from a call that got through (both
+// carry `suppressed`).
 inline constexpr std::string_view kHeldBackReport = "held-back";
 
 // Report lines a sink threw on, lost for good; the run summary shows the count.
@@ -172,9 +172,9 @@ inline void report_pending_rates() {
       r.fields = state.pending->fields;
       r.lineage = state.pending->lineage;
       std::erase_if(r.fields, [](const Field& f) {
-        return f.key == kSuppressedField || f.key == kReportField;
+        return f.key == kSuppressedField || f.key == kEtchField;
       });
-      r.fields.emplace_back(kReportField, kHeldBackReport);
+      r.fields.emplace_back(kEtchField, kHeldBackReport);
       r.fields.emplace_back(kSuppressedField, state.suppressed);
       due.emplace_back(std::move(r), sinks->snapshot());
     }

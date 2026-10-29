@@ -640,8 +640,7 @@ TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
   std::atomic<bool> stop{false};
   std::atomic<int> next{0};
   std::atomic<int> issued{0};
-  int budget_start = 0;
-  int budget_used = 0;
+  bool admitted_in_budget = false;
   {
     std::vector<std::jthread> flooders;
     for (int t = 0; t < kFlooders; ++t) {
@@ -664,11 +663,15 @@ TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
     CHECK_EQ(held->entered.load(), 3);  // the sweep has happened: the slots were freed
     // The budget starts only now, so a slow start of this thread cannot spend it: from here
     // the kept record must get in within kFloodCap flood records.
-    budget_start = next.load();
-    while (async->waiting() > 0 && next.load() - budget_start < kFloodCap) {
+    const int budget_start = next.load();
+    for (;;) {
+      if (async->waiting() == 0) {
+        admitted_in_budget = true;  // decided here, not recomputed from a flood that goes on
+        break;
+      }
+      if (next.load() - budget_start >= kFloodCap) break;
       std::this_thread::yield();
     }
-    budget_used = next.load() - budget_start;
     stop = true;
   }  // the flooders are joined here
   const int sent = issued.load();
@@ -676,7 +679,7 @@ TEST(a_waiting_kept_record_gets_the_freed_slot_before_the_flood) {
   // the reservation removed, the flood takes the freed slots and the budget runs out. Stress
   // coverage, not a proof: a schedule that deschedules every flooder at the moment the slots
   // free passes either way, and the retry window itself has no hook to pin it.
-  CHECK(budget_used < kFloodCap);
+  CHECK(admitted_in_budget);
   CHECK_EQ(async->waiting(), 0u);
   held->allowed = 1 << 20;  // let everything through
   kept.join();
