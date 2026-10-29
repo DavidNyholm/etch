@@ -5,6 +5,13 @@ project(etch
   DESCRIPTION "A small header-only C++23 logger"
   LANGUAGES CXX)
 
+# The version constant in version.hpp is what a program logs; it must say the same as above.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/include/etch/version.hpp" ETCH_VERSION_HEADER)
+string(REGEX MATCH "kVersion = \"([0-9.]+)\"" ETCH_VERSION_MATCH "${ETCH_VERSION_HEADER}")
+if(NOT CMAKE_MATCH_1 STREQUAL PROJECT_VERSION)
+  message(FATAL_ERROR "include/etch/version.hpp says ${CMAKE_MATCH_1}; CMakeLists.txt says ${PROJECT_VERSION}")
+endif()
+
 # The library: header-only, so an INTERFACE target. Consumers do
 #   target_link_libraries(app PRIVATE etch::etch)
 include(GNUInstallDirs)

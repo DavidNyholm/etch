@@ -28,8 +28,8 @@ TEST(an_edit_to_the_agent_profile_style_reaches_the_file) {
     (*agent)->flush();
   }
   const auto lines = read_lines(path);
-  CHECK_EQ(lines.size(), 1u);
-  CHECK(!lines.empty() && lines[0].find("\"thread\":") != std::string::npos);
+  CHECK_EQ(lines.size(), 2u);  // the run header, then the line
+  for (const auto& line : lines) CHECK(line.find("\"thread\":") != std::string::npos);
 }
 
 // Blocks every write until released, so a ring in front of it fills up.
@@ -85,15 +85,85 @@ TEST(open_agent_log_writes_compact_json_lines) {
   log.with({{"fps", 60}}).error("slow");
   (*async)->flush();
   const auto lines = read_lines(path);
-  CHECK_EQ(lines.size(), 2u);
+  CHECK_EQ(lines.size(), 3u);  // the run header, then the two lines
   for (const auto& line : lines) {
     CHECK(line.starts_with("{\"ts\":1"));  // epoch milliseconds, not an ISO string
     CHECK(line.find("\"thread\"") == std::string::npos);
-    CHECK(line.find("\"pid\"") == std::string::npos);
   }
-  if (lines.size() == 2) CHECK(lines[1].find(R"("fields":{"fps":60})") != std::string::npos);
+  if (lines.size() == 3) {
+    CHECK(lines[0].find("\"msg\":\"run started\"") != std::string::npos);
+    CHECK(lines[0].find(std::format("\"run_id\":\"{}\"", etch::run_id())) != std::string::npos);
+    CHECK(lines[0].find("\"pid\":") != std::string::npos);  // on the header line only
+    CHECK(lines[0].find(std::format("\"etch\":\"{}\"", etch::kVersion)) != std::string::npos);
+    CHECK(lines[1].find("\"pid\"") == std::string::npos);
+    CHECK(lines[2].find(R"("fields":{"fps":60})") != std::string::npos);
+  }
   auto refused = etch::open_agent_log(path);  // the file is already open by the first sink
   CHECK(!refused.has_value());
+}
+
+// Game testbed, finding 6: a file that several runs appended to had no run boundary, and the
+// summary could not be tied to a run. Each open writes a header; the id is one per process.
+TEST(each_run_of_an_agent_log_starts_with_a_header_and_the_run_id_is_stable) {
+  const auto path = scratch_dir() / "two-runs.jsonl";
+  CHECK_EQ(etch::run_id().size(), 16u);
+  CHECK_EQ(etch::run_id(), etch::run_id());
+  for (int run = 0; run < 2; ++run) {
+    auto async = etch::open_agent_log(path);
+    CHECK(async.has_value());
+    if (!async) return;
+    etch::Logger log{"agent", {*async}};
+    log.warn("run {}", run);
+  }  // closed: the second open appends
+  const auto lines = read_lines(path);
+  CHECK_EQ(lines.size(), 4u);
+  if (lines.size() < 4) return;
+  CHECK(lines[0].find("run started") != std::string::npos);
+  CHECK(lines[2].find("run started") != std::string::npos);
+  CHECK_EQ(lines[0].substr(lines[0].find("run_id")), lines[2].substr(lines[2].find("run_id")));
+}
+
+TEST(the_summary_carries_the_run_id_the_pid_and_what_wrote_it) {
+  etch::SummarySink summary;
+  const auto json = summary.json();
+  CHECK(json.starts_with(std::format("{{\"etch_summary\":1,\"run_id\":\"{}\",\"pid\":{},",
+                                     etch::run_id(), etch::detail::process_id())));
+  CHECK(json.find("\"written_at\":\"call\"") != std::string::npos);
+  CHECK(summary.json("exit").find("\"written_at\":\"exit\"") != std::string::npos);
+}
+
+// Child probe: the installed summary writes its file the moment a fatal arrives (a run that
+// aborts after its fatal never reaches exit), and the exit handler writes the final object.
+// The parent gives the path, since each process has a scratch directory of its own.
+TEST(zz_child_probe_the_installed_summary_is_written_on_a_fatal) {
+  if (!in_child()) return;
+  const std::filesystem::path path = etch::detail::env("ETCH_TEST_SUMMARY_PATH");
+  CHECK(!path.empty());
+  if (path.empty()) return;
+  auto summary = etch::SummarySink::install(path);
+  etch::warn("before the fatal");
+  CHECK(!std::filesystem::exists(path));  // nothing written yet: no fatal, no exit
+  etch::fatal("the run falls over");
+  const auto at_fatal = read_lines(path);
+  CHECK_EQ(at_fatal.size(), 1u);
+  if (at_fatal.empty()) return;
+  CHECK(at_fatal[0].find("\"written_at\":\"fatal\"") != std::string::npos);
+  CHECK(at_fatal[0].find("\"fatal\":1") != std::string::npos);  // the fatal itself is counted
+  etch::warn("after the fatal");  // the exit handler's object will have it; this one does not
+  CHECK(at_fatal[0].find("\"records\":2") != std::string::npos);
+}
+
+TEST(the_installed_summary_is_written_on_a_fatal_and_again_at_exit) {
+  const auto path = scratch_dir() / "fatal-summary.json";
+  const std::string path_utf8 = etch::utf8(path);
+  CHECK_EQ(run_test_in_child("zz_child_probe_the_installed_summary_is_written_on_a_fatal",
+                             {{"ETCH_TEST_SUMMARY_PATH", path_utf8.c_str()}}),
+           0);
+  const auto at_exit = read_lines(path);
+  CHECK_EQ(at_exit.size(), 1u);
+  if (at_exit.empty()) return;
+  CHECK(at_exit[0].find("\"written_at\":\"exit\"") != std::string::npos);
+  CHECK(at_exit[0].find("\"records\":3") != std::string::npos);
 }
 
 TEST(summary_counts_levels_loggers_and_remembers_first_and_last_error) {

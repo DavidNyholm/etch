@@ -18,9 +18,12 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
+#include <source_location>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -33,6 +36,7 @@
 #include "logger.hpp"
 #include "record.hpp"
 #include "sinks.hpp"
+#include "version.hpp"
 
 namespace etch {
 
@@ -66,15 +70,48 @@ struct AgentProfile {
 
 inline AgentProfile agent_profile() { return AgentProfile{}; }
 
+// One id per process, made at first use from the system's random source: 16 hex digits. The
+// agent file's first record of a run and the run summary both carry it, together with the
+// pid, so a reader can tell the runs apart in a file that several runs appended to and tie a
+// summary to the run it describes. A fork copies it: the child continues the parent's run.
+inline const std::string& run_id() {
+  static const std::string id = [] {
+    std::random_device source;
+    return std::format("{:08x}{:08x}", source(), source());
+  }();
+  return id;
+}
+
+// The record that starts a run in an agent file: "run started" from logger "etch", with the
+// run id, the pid (the profile leaves it off every other line) and the etch version.
+inline Record run_started_record(std::source_location where = std::source_location::current()) {
+  Record r;
+  r.level = Level::kInfo;
+  r.time = std::chrono::system_clock::now();
+  r.thread = std::this_thread::get_id();
+  r.thread_index = detail::this_thread_index();
+  r.where = where;
+  r.logger_name = "etch";
+  r.message = "run started";
+  r.fields.emplace_back("run_id", run_id());
+  r.fields.emplace_back("pid", detail::process_id());
+  r.fields.emplace_back("etch", kVersion);
+  return r;
+}
+
 // Opens the file an agent will read: a JSON file sink in the agent profile behind an async
 // sink that drops trace, debug and info rather than stall the caller, keeps warnings and
-// above, and marks every gap. Returns the async sink; attach it to a logger.
+// above, and marks every gap. The file is appended to, and each run begins with a "run
+// started" record (above), written straight into the file before anything is queued, so a
+// reader can find the run boundaries and the run id. Returns the async sink; attach it to a
+// logger.
 [[nodiscard]] inline std::expected<std::shared_ptr<AsyncSink>, std::error_code> open_agent_log(
     const std::filesystem::path& path, AgentProfile profile = agent_profile()) {
   FileSinkOptions options = profile.file;
   options.style = profile.style;  // the profile's style wins, so an edit to it is not lost
   auto file = FileSink::open(path, std::move(options));
   if (!file) return std::unexpected(file.error());
+  (*file)->write(run_started_record());
   return std::make_shared<AsyncSink>(std::move(*file), profile.queue_capacity, profile.overflow,
                                      profile.keep_from, profile.worker_priority);
 }
@@ -86,7 +123,10 @@ inline AgentProfile agent_profile() { return AgentProfile{}; }
 //
 // Give it to the same logger as the real sinks (it is cheap: a few counters under a mutex),
 // and watch() the sinks whose counters matter. write_to() writes the object to a file at any
-// time; install() does all of that for the default logger and writes the file at exit.
+// time; install() does all of that for the default logger and writes the file at exit, and
+// also the moment a fatal record arrives, since a run that aborts after its fatal never
+// reaches exit. The object says which ("written_at": "exit", "fatal" or "call") and carries
+// the run id and pid, so it can be tied to the agent file's run.
 class SummarySink final : public Sink {
  public:
   struct ErrorSeen {
@@ -101,17 +141,20 @@ class SummarySink final : public Sink {
   SummarySink() : started_(std::chrono::system_clock::now()) {}
 
   void write(const Record& r) override {
-    std::lock_guard lock(mutex_);
-    ++total_;
-    if (r.level < Level::kOff) ++by_level_[static_cast<std::size_t>(r.level)];
-    ++by_logger_[r.logger_name];
-    if (r.level >= Level::kError) {
-      ErrorSeen seen{r.time,         r.level,
-                     r.logger_name,  std::string(detail::base_name(r.where.file_name())),
-                     r.where.line(), std::string(r.user_message())};
-      if (!first_error_) first_error_ = seen;
-      last_error_ = std::move(seen);
+    {
+      std::lock_guard lock(mutex_);
+      ++total_;
+      if (r.level < Level::kOff) ++by_level_[static_cast<std::size_t>(r.level)];
+      ++by_logger_[r.logger_name];
+      if (r.level >= Level::kError) {
+        ErrorSeen seen{r.time,         r.level,
+                       r.logger_name,  std::string(detail::base_name(r.where.file_name())),
+                       r.where.line(), std::string(r.user_message())};
+        if (!first_error_) first_error_ = seen;
+        last_error_ = std::move(seen);
+      }
     }
+    if (r.level == Level::kFatal) write_now("fatal");
   }
 
   // Sinks whose own counters belong in the summary. What is kept is the sink's counters, which
@@ -159,11 +202,15 @@ class SummarySink final : public Sink {
     return last_error_;
   }
 
-  // The whole run as one JSON object (one line, no trailing newline).
-  std::string json() const {
+  // The whole run as one JSON object (one line, no trailing newline). `written_at` says what
+  // produced it: "call" (the program asked), "fatal" or "exit" (the installed summary).
+  std::string json(std::string_view written_at = "call") const {
     std::lock_guard lock(mutex_);
-    std::string out = "{\"etch_summary\":1";
+    std::string out = "{\"etch_summary\":1,\"run_id\":";
     auto app = std::back_inserter(out);
+    json_string(run_id(), out);
+    std::format_to(app, ",\"pid\":{},\"written_at\":", detail::process_id());
+    json_string(written_at, out);
     out += ",\"started\":\"";
     format_time_iso8601(out, started_);
     out += "\",\"ended\":\"";
@@ -202,7 +249,8 @@ class SummarySink final : public Sink {
 
   // Writes the object and a newline to the file (replacing it), making missing parent
   // directories like FileSink does. Returns the OS error if any.
-  std::error_code write_to(const std::filesystem::path& path) const {
+  std::error_code write_to(const std::filesystem::path& path,
+                           std::string_view written_at = "call") const {
     if (path.has_parent_path()) {
       std::error_code ec;
       std::filesystem::create_directories(path.parent_path(), ec);  // the open reports failure
@@ -210,7 +258,7 @@ class SummarySink final : public Sink {
     errno = 0;
     std::ofstream out(path, std::ios::out | std::ios::binary | std::ios::trunc);
     if (!out.is_open()) return std::error_code(errno != 0 ? errno : EIO, std::generic_category());
-    out << json() << '\n';
+    out << json(written_at) << '\n';
     out.flush();
     return out ? std::error_code{} : std::make_error_code(std::errc::io_error);
   }
@@ -255,16 +303,7 @@ class SummarySink final : public Sink {
         }
         flush_all();
         s.sink->flush_watched();
-        if (const auto ec = s.sink->write_to(s.path)) {
-          // No logger left to report to: stderr is the one place a failure at exit can go,
-          // best effort, because nothing may throw out of an exit handler.
-          try {
-            std::fprintf(stderr, "etch: could not write the run summary to %s: %s\n",
-                         utf8(s.path).c_str(), ec.message().c_str());
-          } catch (...) {
-            // Even the message could not be built: nothing left to do.
-          }
-        }
+        if (const auto ec = s.sink->write_to(s.path, "exit")) report_failure(s.path, ec);
       });
     }
     return summary;
@@ -282,6 +321,39 @@ class SummarySink final : public Sink {
   static Installed& installed() {
     static Installed* const slot = new Installed;
     return *slot;
+  }
+
+  // Writes the installed summary's file at once, if this is it. The async sinks are not
+  // drained first: that can wait for a worker, and this may run on one (a fatal logged from
+  // a sink), so the drop counts are the counts so far; the exit handler writes the final
+  // object. The slot is only tried: the exit handler holds it while it waits for the
+  // workers, and a worker blocking on it here would be the deadlock; the handler is writing
+  // the file anyway.
+  void write_now(std::string_view written_at) {
+    auto& slot = installed();
+    if (!slot.mutex.try_lock()) return;
+    std::filesystem::path path;
+    {
+      std::lock_guard lock(slot.mutex, std::adopt_lock);
+      if (slot.sink.get() != this ||
+          slot.fork_generation != detail::fork_generation().load(std::memory_order_relaxed)) {
+        return;
+      }
+      path = slot.path;
+    }
+    if (const auto ec = write_to(path, written_at)) report_failure(path, ec);
+  }
+
+  // No logger to report to (the summary is a sink, and at exit none may be left): stderr is
+  // the one place this can go, best effort, because nothing may throw out of an exit handler
+  // or a sink's write.
+  static void report_failure(const std::filesystem::path& path, std::error_code ec) noexcept {
+    try {
+      std::fprintf(stderr, "etch: could not write the run summary to %s: %s\n", utf8(path).c_str(),
+                   ec.message().c_str());
+    } catch (...) {
+      // Even the message could not be built: nothing left to do.
+    }
   }
 
   static void append_error(std::string_view key, const std::optional<ErrorSeen>& error,

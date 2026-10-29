@@ -26,3 +26,4 @@
 #include "record_ring.hpp"
 #include "sink_set.hpp"
 #include "sinks.hpp"
+#include "version.hpp"

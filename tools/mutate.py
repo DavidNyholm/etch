@@ -157,6 +157,21 @@ MUTATIONS = [
         [("        r.fields = std::move(state.pending->fields);\n", "")],
     ),
     (
+        "agent.hpp",
+        "the agent log starts a run without a header record",
+        [("  (*file)->write(run_started_record());\n", "")],
+    ),
+    (
+        "agent.hpp",
+        "the summary carries an empty run id",
+        [("  json_string(run_id(), out);\n", "  json_string(\"\", out);\n")],
+    ),
+    (
+        "agent.hpp",
+        "the installed summary is not written on a fatal",
+        [("    if (r.level == Level::kFatal) write_now(\"fatal\");\n", "")],
+    ),
+    (
         "async_sink.hpp",
         "shutdown does not report the held-back counts",
         [("      detail::report_pending_rates();\n", "")],
